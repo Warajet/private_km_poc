@@ -1,0 +1,31 @@
+# Dependencies (rebuilt inside Docker)
+node_modules/
+
+# Next.js build cache
+.next/
+
+# SQLite data (never bake DB into the image)
+data/
+
+# Environment files (injected at runtime via Cloud Run secrets)
+.env
+.env.local
+.env.*.local
+
+# Git
+.git/
+.gitignore
+
+# Editor / OS
+.DS_Store
+*.pem
+.vscode/
+.idea/
+
+# Docs (not needed at runtime)
+*.md
+DEPLOYMENT.md
+
+# Test / CI artifacts
+coverage/
+.nyc_output/
