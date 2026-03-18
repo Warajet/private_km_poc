@@ -1,0 +1,18 @@
+import { NextResponse } from 'next/server';
+import { getAuthFromRequest } from '@/lib/auth';
+import { getSessionById, getMessagesBySession } from '@/lib/db';
+
+export async function GET(request: Request, { params }: { params: { id: string } }) {
+  const auth = await getAuthFromRequest(request);
+  if (!auth) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  const session = getSessionById(params.id, auth.userId);
+  if (!session) {
+    return NextResponse.json({ error: 'Session not found' }, { status: 404 });
+  }
+
+  const messages = getMessagesBySession(params.id);
+  return NextResponse.json(messages);
+}
