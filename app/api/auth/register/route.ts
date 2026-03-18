@@ -22,13 +22,13 @@ export async function POST(request: Request) {
       );
     }
 
-    const existing = getUserByUsername(username);
+    const existing = await getUserByUsername(username);
     if (existing) {
       return NextResponse.json({ error: 'Username is already taken' }, { status: 409 });
     }
 
     const passwordHash = await hashPassword(password);
-    const user = createUser(username, email?.trim() || null, passwordHash);
+    const user = await createUser(username, email?.trim() || null, passwordHash);
     const token = await createToken(user.id, user.username);
 
     const response = NextResponse.json(

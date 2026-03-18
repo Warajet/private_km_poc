@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: private-km
+  namespace: private-km
+  labels:
+    app.kubernetes.io/name: private-km
+spec:
+  type: ClusterIP      # Traffic enters via Ingress; no direct NodePort exposure
+  selector:
+    app.kubernetes.io/name: private-km
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP

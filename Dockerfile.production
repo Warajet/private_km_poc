@@ -1,0 +1,63 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Dockerfile.production
+#
+# Use this file (not Dockerfile) when building the production image that
+# connects to Huawei RDS (PostgreSQL) instead of SQLite.
+#
+# Build command:
+#   docker build \
+#     --platform linux/amd64 \
+#     --file Dockerfile.production \
+#     --tag SWR_ADDRESS/ORGANISATION/private-km:TAG \
+#     .
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Stage 1: Builder ──────────────────────────────────────────────────────────
+FROM node:20-slim AS builder
+
+WORKDIR /app
+
+# Swap SQLite adapter for the PostgreSQL one before installing deps.
+# lib/db-cloud-sql.ts has the same async interface as lib/db.ts so no
+# route files need to change.
+COPY package*.json ./
+COPY lib/db-cloud-sql.ts ./lib/db.ts
+
+# Replace better-sqlite3 with pg in package.json and install
+RUN apt-get update && apt-get install -y python3 make g++ jq \
+    && rm -rf /var/lib/apt/lists/* \
+    && node -e " \
+        const p = JSON.parse(require('fs').readFileSync('package.json','utf8')); \
+        delete p.dependencies['better-sqlite3']; \
+        p.dependencies['pg'] = '^8.12.0'; \
+        require('fs').writeFileSync('package.json', JSON.stringify(p, null, 2)); \
+      " \
+    && npm ci
+
+# Copy remaining source (lib/db.ts already set above)
+COPY --exclude=lib/db.ts . .
+
+RUN npm run build
+
+# ── Stage 2: Production runtime ───────────────────────────────────────────────
+FROM node:20-slim AS runner
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+RUN groupadd --system --gid 1001 nodejs && \
+    useradd  --system --uid 1001 --gid nodejs nextjs
+
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules  ./node_modules
+COPY --from=builder --chown=nextjs:nodejs /app/.next         ./.next
+COPY --from=builder --chown=nextjs:nodejs /app/public        ./public
+COPY --from=builder --chown=nextjs:nodejs /app/next.config.js ./next.config.js
+COPY --from=builder --chown=nextjs:nodejs /app/package.json  ./package.json
+
+RUN mkdir -p /app/data && chown nextjs:nodejs /app/data
+
+USER nextjs
+
+EXPOSE 8080
+CMD ["npm", "start"]

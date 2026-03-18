@@ -8,11 +8,11 @@ export async function GET(request: Request, { params }: { params: { id: string }
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const session = getSessionById(params.id, auth.userId);
+  const session = await getSessionById(params.id, auth.userId);
   if (!session) {
     return NextResponse.json({ error: 'Session not found' }, { status: 404 });
   }
 
-  const messages = getMessagesBySession(params.id);
+  const messages = await getMessagesBySession(params.id);
   return NextResponse.json(messages);
 }

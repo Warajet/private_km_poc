@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: private-km-config
+  namespace: private-km
+  labels:
+    app.kubernetes.io/name: private-km
+data:
+  # ── Runtime ──────────────────────────────────────────────────────────────────
+  NODE_ENV: "production"
+  PORT: "8080"
+
+  # ── Gemini / Vertex AI ────────────────────────────────────────────────────────
+  # When GOOGLE_CLOUD_PROJECT is set, lib/gemini.ts uses Vertex AI automatically.
+  # Authentication is done via the GCP service account JSON mounted at
+  # /var/secrets/gcp/key.json (see deployment.yaml).
+  GOOGLE_CLOUD_PROJECT: "YOUR_GCP_PROJECT_ID"           # ← replace
+  GOOGLE_CLOUD_LOCATION: "us-central1"                  # ← Vertex AI region
+  GEMINI_MODEL: "gemini-1.5-pro"
+
+  # ── Optional: AI persona ────────────────────────────────────────────────────
+  # SYSTEM_PROMPT: "You are a helpful assistant for Acme Corp."

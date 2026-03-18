@@ -1,3 +1,15 @@
+/**
+ * lib/db.ts — SQLite adapter (local development)
+ *
+ * All functions are async so this file shares an identical interface with
+ * lib/db-cloud-sql.ts (PostgreSQL). Dockerfile.production swaps this file
+ * with db-cloud-sql.ts before building the production image — zero route
+ * changes required.
+ *
+ * The `async` keyword on each function automatically wraps the synchronous
+ * better-sqlite3 return value in a resolved Promise.
+ */
+
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
@@ -24,32 +36,32 @@ function getDb(): Database.Database {
 function initDb(database: Database.Database) {
   database.exec(`
     CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      username TEXT UNIQUE NOT NULL,
-      email TEXT UNIQUE,
+      id           TEXT PRIMARY KEY,
+      username     TEXT UNIQUE NOT NULL,
+      email        TEXT UNIQUE,
       password_hash TEXT NOT NULL,
-      created_at INTEGER NOT NULL
+      created_at   INTEGER NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS sessions (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      title TEXT NOT NULL DEFAULT 'New Chat',
+      id         TEXT PRIMARY KEY,
+      user_id    TEXT NOT NULL,
+      title      TEXT NOT NULL DEFAULT 'New Chat',
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS messages (
-      id TEXT PRIMARY KEY,
+      id         TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
-      content TEXT NOT NULL,
+      role       TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+      content    TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
     );
 
-    CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_user_id    ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
   `);
 }
@@ -80,11 +92,11 @@ export interface Message {
 
 // ─── User Operations ──────────────────────────────────────────────────────────
 
-export function createUser(
+export async function createUser(
   username: string,
   email: string | null,
   passwordHash: string
-): User {
+): Promise<User> {
   const id = uuidv4();
   const now = Date.now();
   getDb()
@@ -95,13 +107,13 @@ export function createUser(
   return { id, username, email: email || undefined, password_hash: passwordHash, created_at: now };
 }
 
-export function getUserByUsername(username: string): User | undefined {
+export async function getUserByUsername(username: string): Promise<User | undefined> {
   return getDb()
     .prepare('SELECT * FROM users WHERE username = ?')
     .get(username) as User | undefined;
 }
 
-export function getUserById(id: string): User | undefined {
+export async function getUserById(id: string): Promise<User | undefined> {
   return getDb()
     .prepare('SELECT * FROM users WHERE id = ?')
     .get(id) as User | undefined;
@@ -109,7 +121,7 @@ export function getUserById(id: string): User | undefined {
 
 // ─── Session Operations ───────────────────────────────────────────────────────
 
-export function createSession(userId: string, title = 'New Chat'): Session {
+export async function createSession(userId: string, title = 'New Chat'): Promise<Session> {
   const id = uuidv4();
   const now = Date.now();
   getDb()
@@ -120,31 +132,31 @@ export function createSession(userId: string, title = 'New Chat'): Session {
   return { id, user_id: userId, title, created_at: now, updated_at: now };
 }
 
-export function getSessionsByUser(userId: string): Session[] {
+export async function getSessionsByUser(userId: string): Promise<Session[]> {
   return getDb()
     .prepare('SELECT * FROM sessions WHERE user_id = ? ORDER BY updated_at DESC')
     .all(userId) as Session[];
 }
 
-export function getSessionById(id: string, userId: string): Session | undefined {
+export async function getSessionById(id: string, userId: string): Promise<Session | undefined> {
   return getDb()
     .prepare('SELECT * FROM sessions WHERE id = ? AND user_id = ?')
     .get(id, userId) as Session | undefined;
 }
 
-export function updateSessionTitle(id: string, userId: string, title: string): void {
+export async function updateSessionTitle(id: string, userId: string, title: string): Promise<void> {
   getDb()
     .prepare('UPDATE sessions SET title = ?, updated_at = ? WHERE id = ? AND user_id = ?')
     .run(title, Date.now(), id, userId);
 }
 
-export function touchSession(id: string): void {
+export async function touchSession(id: string): Promise<void> {
   getDb()
     .prepare('UPDATE sessions SET updated_at = ? WHERE id = ?')
     .run(Date.now(), id);
 }
 
-export function deleteSession(id: string, userId: string): void {
+export async function deleteSession(id: string, userId: string): Promise<void> {
   getDb()
     .prepare('DELETE FROM sessions WHERE id = ? AND user_id = ?')
     .run(id, userId);
@@ -152,11 +164,11 @@ export function deleteSession(id: string, userId: string): void {
 
 // ─── Message Operations ───────────────────────────────────────────────────────
 
-export function addMessage(
+export async function addMessage(
   sessionId: string,
   role: 'user' | 'assistant',
   content: string
-): Message {
+): Promise<Message> {
   const id = uuidv4();
   const now = Date.now();
   getDb()
@@ -167,7 +179,7 @@ export function addMessage(
   return { id, session_id: sessionId, role, content, created_at: now };
 }
 
-export function getMessagesBySession(sessionId: string): Message[] {
+export async function getMessagesBySession(sessionId: string): Promise<Message[]> {
   return getDb()
     .prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC')
     .all(sessionId) as Message[];

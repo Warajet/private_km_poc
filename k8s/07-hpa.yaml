@@ -1,0 +1,48 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: private-km
+  namespace: private-km
+  labels:
+    app.kubernetes.io/name: private-km
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: private-km
+
+  minReplicas: 2    # Always keep 2 pods running (HA)
+  maxReplicas: 10   # Cap spend; raise if you expect >10x peak traffic
+
+  metrics:
+    # Scale out when average CPU across pods exceeds 60%
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+
+    # Scale out when average memory exceeds 75%
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+
+  behavior:
+    scaleUp:
+      # React quickly to traffic spikes (15 s stabilisation window)
+      stabilizationWindowSeconds: 15
+      policies:
+        - type: Pods
+          value: 2           # Add at most 2 pods per scaling event
+          periodSeconds: 30
+    scaleDown:
+      # Be conservative when scaling down to avoid thrashing (5 min window)
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1           # Remove at most 1 pod per scaling event
+          periodSeconds: 60

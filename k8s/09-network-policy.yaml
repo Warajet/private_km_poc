@@ -1,0 +1,116 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NetworkPolicy — default-deny, then selectively allow only what is needed.
+#
+# Ingress:  allow from ingress controller (kube-system) only
+# Egress:   allow DNS, RDS (PostgreSQL), and external HTTPS (Vertex AI)
+#           block everything else
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── 1. Default deny all ingress and egress in the namespace ───────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: private-km
+spec:
+  podSelector: {}   # applies to ALL pods in the namespace
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# ── 2. Allow ingress from the ELB / ingress controller ────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-controller
+  namespace: private-km
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: private-km
+  policyTypes:
+    - Ingress
+  ingress:
+    # Huawei CCE ELB ingress controller lives in kube-system
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 8080
+          protocol: TCP
+
+---
+# ── 3. Allow egress to kube-dns (name resolution) ────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: private-km
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: private-km
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+---
+# ── 4. Allow egress to Huawei RDS (PostgreSQL) ───────────────────────────────
+# Replace the CIDR below with your actual RDS private IP address range.
+# Find it in: Huawei Console → RDS → Your instance → Connection Information
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-rds-postgres
+  namespace: private-km
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: private-km
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        # Narrow this to your RDS private IP, e.g. 192.168.0.150/32
+        - ipBlock:
+            cidr: 192.168.0.0/24     # ← replace with your RDS subnet CIDR
+      ports:
+        - port: 5432
+          protocol: TCP
+
+---
+# ── 5. Allow egress to external HTTPS (Vertex AI / Google APIs) ───────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-external-https
+  namespace: private-km
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: private-km
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 443
+          protocol: TCP
+      # Restrict to only Google API IP ranges for tighter security.
+      # The ranges below are the main Google API endpoints; check
+      # https://www.gstatic.com/ipranges/goog.json for the full list.
+      # For simplicity in a POC you can remove the `to` block to allow
+      # all HTTPS egress, then tighten later.
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8        # no internal traffic on port 443
+              - 172.16.0.0/12
+              - 192.168.0.0/16

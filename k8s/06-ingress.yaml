@@ -1,0 +1,97 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Huawei Cloud ELB Ingress (recommended for CCE)
+#
+# Two options are provided. Uncomment the one that matches your setup.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Option A: Huawei ELB Ingress (native — auto-creates a public ELB) ─────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: private-km
+  namespace: private-km
+  labels:
+    app.kubernetes.io/name: private-km
+  annotations:
+    # Use the CCE-native ELB ingress controller
+    kubernetes.io/ingress.class: "cce"
+
+    # ELB type: "union" (shared) or "performance" (dedicated)
+    kubernetes.io/elb.class: "union"
+
+    # Auto-create a new public ELB with 5 Mbit/s bandwidth.
+    # Remove this block and add kubernetes.io/elb.id if you want to reuse
+    # an existing ELB instance.
+    kubernetes.io/elb.autocreate: |
+      {
+        "type": "public",
+        "bandwidth_name": "private-km-bandwidth",
+        "bandwidth_chargemode": "traffic",
+        "bandwidth_size": 5,
+        "bandwidth_sharetype": "PER",
+        "eip_type": "5_bgp"
+      }
+
+    # TLS certificate ID from Huawei Cloud SCM (Server Certificate Manager).
+    # Upload your certificate to SCM first, then paste the certificate ID here.
+    kubernetes.io/elb.cert-id: "REPLACE_WITH_SCM_CERT_ID"
+
+    # Increase timeout for streaming (AI responses can take tens of seconds)
+    kubernetes.io/elb.idle-timeout: "120"
+    kubernetes.io/elb.request-timeout: "120"
+    kubernetes.io/elb.response-timeout: "120"
+
+spec:
+  rules:
+    - host: chat.yourcompany.com    # ← replace with your domain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: private-km
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - chat.yourcompany.com      # ← replace with your domain
+      secretName: private-km-tls   # Optional: K8s TLS secret; ELB cert-id takes precedence
+
+---
+# ── Option B: NGINX Ingress (if you installed the NGINX controller in CCE) ───
+# Uncomment this block and comment out Option A above if using NGINX ingress.
+#
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: private-km-nginx
+#   namespace: private-km
+#   labels:
+#     app.kubernetes.io/name: private-km
+#   annotations:
+#     kubernetes.io/ingress.class: "nginx"
+#     nginx.ingress.kubernetes.io/ssl-redirect: "true"
+#     # Long timeouts for streaming AI responses
+#     nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+#     nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+#     nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+#     # Disable response buffering so tokens stream to the client in real time
+#     nginx.ingress.kubernetes.io/proxy-buffering: "off"
+# spec:
+#   ingressClassName: nginx
+#   rules:
+#     - host: chat.yourcompany.com
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: private-km
+#                 port:
+#                   number: 80
+#   tls:
+#     - hosts:
+#         - chat.yourcompany.com
+#       secretName: private-km-tls

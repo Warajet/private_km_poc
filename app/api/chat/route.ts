@@ -27,16 +27,16 @@ export async function POST(request: Request) {
   }
 
   // Verify ownership — users only access their own sessions
-  const session = getSessionById(sessionId, auth.userId);
+  const session = await getSessionById(sessionId, auth.userId);
   if (!session) {
     return NextResponse.json({ error: 'Session not found' }, { status: 404 });
   }
 
   // Load this user's conversation history for this session
-  const history = getMessagesBySession(sessionId);
+  const history = await getMessagesBySession(sessionId);
 
   // Persist user message immediately
-  addMessage(sessionId, 'user', message.trim());
+  await addMessage(sessionId, 'user', message.trim());
 
   // Auto-title the session from the first user message
   if (history.length === 0) {
@@ -44,10 +44,10 @@ export async function POST(request: Request) {
       message.trim().length > 60
         ? message.trim().slice(0, 60) + '…'
         : message.trim();
-    updateSessionTitle(sessionId, auth.userId, title);
+    await updateSessionTitle(sessionId, auth.userId, title);
   }
 
-  touchSession(sessionId);
+  await touchSession(sessionId);
 
   try {
     const streamResult = await streamChatResponse(history, message.trim());
@@ -63,7 +63,7 @@ export async function POST(request: Request) {
             controller.enqueue(new TextEncoder().encode(text));
           }
           // Persist the complete assistant response
-          addMessage(sessionId, 'assistant', fullResponse);
+          await addMessage(sessionId, 'assistant', fullResponse);
           controller.close();
         } catch (err) {
           console.error('[chat stream]', err);
@@ -81,10 +81,10 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     console.error('[chat]', error);
-    const message =
+    const errMessage =
       error instanceof Error && error.message.includes('GEMINI_API_KEY')
         ? 'Gemini API key is not configured. Please set GEMINI_API_KEY in your .env.local file.'
         : 'Failed to get a response from the AI. Please try again.';
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ error: errMessage }, { status: 500 });
   }
 }

@@ -8,7 +8,7 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const sessions = getSessionsByUser(auth.userId);
+  const sessions = await getSessionsByUser(auth.userId);
   return NextResponse.json(sessions);
 }
 
@@ -18,6 +18,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const session = createSession(auth.userId);
+  const session = await createSession(auth.userId);
   return NextResponse.json(session, { status: 201 });
 }

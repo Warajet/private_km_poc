@@ -8,7 +8,7 @@ export async function GET(request: Request, { params }: { params: { id: string }
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const session = getSessionById(params.id, auth.userId);
+  const session = await getSessionById(params.id, auth.userId);
   if (!session) {
     return NextResponse.json({ error: 'Session not found' }, { status: 404 });
   }
@@ -22,11 +22,11 @@ export async function DELETE(request: Request, { params }: { params: { id: strin
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const session = getSessionById(params.id, auth.userId);
+  const session = await getSessionById(params.id, auth.userId);
   if (!session) {
     return NextResponse.json({ error: 'Session not found' }, { status: 404 });
   }
 
-  deleteSession(params.id, auth.userId);
+  await deleteSession(params.id, auth.userId);
   return NextResponse.json({ success: true });
 }

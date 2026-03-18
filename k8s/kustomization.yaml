@@ -1,0 +1,33 @@
+# kustomization.yaml
+#
+# Apply all manifests in order with a single command:
+#   kubectl apply -k k8s/
+#
+# Or apply individual files:
+#   kubectl apply -f k8s/00-namespace.yaml
+#   kubectl apply -f k8s/01-serviceaccount.yaml
+#   ...
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: private-km
+
+resources:
+  - 00-namespace.yaml
+  - 01-serviceaccount.yaml
+  - 02-configmap.yaml
+  # NOTE: 03-secret.example.yaml is NOT listed here.
+  # Create secrets manually with kubectl create secret (see HUAWEI_DEPLOYMENT.md).
+  - 04-deployment.yaml
+  - 05-service.yaml
+  - 06-ingress.yaml
+  - 07-hpa.yaml
+  - 08-pdb.yaml
+  - 09-network-policy.yaml
+
+# ── Image tag management ──────────────────────────────────────────────────────
+# Update the newTag value and run `kubectl apply -k k8s/` to deploy a new image.
+images:
+  - name: swr.ap-southeast-3.myhuaweicloud.com/YOUR_ORG/private-km
+    newTag: latest    # replace with a specific SHA or semver tag in production

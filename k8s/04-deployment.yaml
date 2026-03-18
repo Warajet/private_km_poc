@@ -1,0 +1,173 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: private-km
+  namespace: private-km
+  labels:
+    app.kubernetes.io/name: private-km
+    app.kubernetes.io/component: web
+  annotations:
+    # Bump this value (e.g. date) to force a rolling restart without an image change
+    deployment.kubernetes.io/revision: "1"
+spec:
+  # Minimum 2 replicas so one can always serve while the other is updated
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: private-km
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # Never take a pod down before a new one is ready
+      maxSurge: 1         # Spin up one extra pod during an update
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: private-km
+        app.kubernetes.io/component: web
+      annotations:
+        # When secrets are rotated, update this annotation to trigger a
+        # rolling restart: kubectl annotate deployment private-km \
+        #   secret-hash="$(date +%s)" -n private-km
+        secret-hash: "initial"
+
+    spec:
+      serviceAccountName: private-km
+      automountServiceAccountToken: false
+
+      # ── Scheduling: spread pods across nodes for HA ─────────────────────────
+      affinity:
+        podAntiAffinity:
+          # Prefer different nodes; hard-require if you have 3+ nodes
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: private-km
+                topologyKey: kubernetes.io/hostname
+
+      # Give Next.js time to drain in-flight streaming responses (60 s)
+      terminationGracePeriodSeconds: 60
+
+      # ── Pod-level security ──────────────────────────────────────────────────
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+
+      # ── Volumes ─────────────────────────────────────────────────────────────
+      volumes:
+        # GCP service account key for Vertex AI authentication
+        - name: gcp-credentials
+          secret:
+            secretName: gcp-service-account
+            defaultMode: 0400   # owner read-only
+        # Writable /tmp required when readOnlyRootFilesystem is true
+        - name: tmp
+          emptyDir: {}
+
+      # ── Image pull secret (Huawei SWR) ──────────────────────────────────────
+      imagePullSecrets:
+        - name: swr-secret   # created via: kubectl create secret docker-registry
+
+      containers:
+        - name: app
+          # Replace with your actual SWR image address after pushing
+          # Format: swr.REGION.myhuaweicloud.com/ORGANISATION/private-km:TAG
+          image: swr.ap-southeast-3.myhuaweicloud.com/YOUR_ORG/private-km:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          # ── Container-level security ────────────────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          # ── Resource budgets ─────────────────────────────────────────────────
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+
+          # ── Environment (non-sensitive) ─────────────────────────────────────
+          envFrom:
+            - configMapRef:
+                name: private-km-config
+
+          # ── Environment (sensitive — from Secrets) ───────────────────────────
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: DATABASE_URL
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: JWT_SECRET
+            # Tell the Google SDK where to find the service account key
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /var/secrets/gcp/key.json
+
+          # ── Volume mounts ────────────────────────────────────────────────────
+          volumeMounts:
+            - name: gcp-credentials
+              mountPath: /var/secrets/gcp
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+          # ── Health probes ────────────────────────────────────────────────────
+          # Liveness: restart the pod if it stops responding
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Readiness: only send traffic once the app is fully started
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # Startup: give Next.js up to 90 s to compile on first start
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 18   # 18 × 5s = 90 s max startup window
+
+          # ── Graceful shutdown ────────────────────────────────────────────────
+          lifecycle:
+            preStop:
+              exec:
+                # Sleep 5 s so the load balancer can drain connections before
+                # SIGTERM is sent, avoiding 502s during rolling updates
+                command: ["/bin/sh", "-c", "sleep 5"]
