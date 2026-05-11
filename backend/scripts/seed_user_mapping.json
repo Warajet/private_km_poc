@@ -1,0 +1,26 @@
+{
+  "userA@hello.org": {
+    "department": "A",
+    "jd_code": "ENG001",
+    "display_name": "User A",
+    "relate_groups": ["ab"]
+  },
+  "userB@hello.org": {
+    "department": "A",
+    "jd_code": "ENG002",
+    "display_name": "User B",
+    "relate_groups": []
+  },
+  "userC@hello.org": {
+    "department": "B",
+    "jd_code": "MKT001",
+    "display_name": "User C",
+    "relate_groups": ["ab"]
+  },
+  "userD@hello.org": {
+    "department": "B",
+    "jd_code": "MKT002",
+    "display_name": "User D",
+    "relate_groups": []
+  }
+}

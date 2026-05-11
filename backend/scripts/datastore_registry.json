@@ -1,0 +1,15 @@
+{
+  "_comment": "Maps access-level buckets to Discovery Engine datastore IDs. Update IDs to match your GCP project.",
+  "public": "public-datastore",
+  "internal": {
+    "A": "internal-dept-a-datastore",
+    "B": "internal-dept-b-datastore",
+    "C": "internal-dept-c-datastore"
+  },
+  "relate": {
+    "ab":  "relate-ab-datastore",
+    "ac":  "relate-ac-datastore",
+    "abc": "relate-abc-datastore"
+  },
+  "confidential": "confidential-datastore"
+}
