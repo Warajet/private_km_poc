@@ -40,15 +40,17 @@ class Settings(BaseSettings):
 
     # ── GCP Core ───────────────────────────────────────────────────────────────
     gcp_project_id: str
-    # Use "global" for Discovery Engine; GeminiService maps "global" → "us-central1"
-    # for Vertex AI which requires a regional location.
     gcp_location: str = "global"
-    # Vertex AI region used by GeminiService (separate from DE location).
-    vertex_ai_location: str = "us-central1"
 
     # ── Discovery Engine ───────────────────────────────────────────────────────
-    # Serving config ID is shared across all buckets (each datastore gets its own).
-    discovery_engine_serving_config_id: str = "default_config"
+    # Engine (Vertex AI Search App) that has all bucket datastores attached.
+    # Required for multi-datastore answer_query() with DataStoreSpecs.
+    # Create via: gcloud discovery-engine engines create ...
+    # or in the GCP Console → Vertex AI Search → Apps.
+    discovery_engine_engine_id: str
+
+    # Serving config ID used on both the engine and per-datastore serving configs.
+    discovery_engine_serving_config_id: str = "default_serving_config"
 
     # ── Datastore Registry ─────────────────────────────────────────────────────
     # Path to a JSON file that maps bucket type → datastore ID(s).
@@ -120,6 +122,40 @@ class Settings(BaseSettings):
         return v
 
     # ── Derived helpers ────────────────────────────────────────────────────────
+    # ── Derived path helpers ───────────────────────────────────────────────────
+    @property
+    def engine_serving_config_path(self) -> str:
+        """
+        Engine-level serving config used by answer_query() with DataStoreSpecs.
+        The engine must have all bucket datastores attached in the GCP Console.
+        """
+        return (
+            f"projects/{self.gcp_project_id}"
+            f"/locations/{self.gcp_location}"
+            f"/collections/default_collection"
+            f"/engines/{self.discovery_engine_engine_id}"
+            f"/servingConfigs/{self.discovery_engine_serving_config_id}"
+        )
+
+    def datastore_resource_name(self, datastore_id: str) -> str:
+        """Full resource name for a datastore, used in DataStoreSpec.data_store."""
+        return (
+            f"projects/{self.gcp_project_id}"
+            f"/locations/{self.gcp_location}"
+            f"/collections/default_collection"
+            f"/dataStores/{datastore_id}"
+        )
+
+    def engine_session_auto_path(self) -> str:
+        """Auto-create session path for the first turn of a conversation."""
+        return (
+            f"projects/{self.gcp_project_id}"
+            f"/locations/{self.gcp_location}"
+            f"/collections/default_collection"
+            f"/engines/{self.discovery_engine_engine_id}"
+            f"/sessions/-"
+        )
+
     def department_email(self, department: str) -> str:
         return self.department_email_template.format(
             department=department.upper(),

@@ -21,21 +21,22 @@ class ChatMessage:
     role: MessageRole
     content: str
     timestamp: datetime = field(default_factory=datetime.utcnow)
-    # Sources attached to an assistant message
     sources: List[RetrievedDocument] = field(default_factory=list)
 
 
 @dataclass
 class ChatSession:
     id: str
-    user_email: str          # HWC user email
+    user_email: str
     department: str
     jd_code: str
     messages: List[ChatMessage] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
-    # Discovery Engine conversation resource name (persisted across turns)
-    de_conversation_name: Optional[str] = None
+    # Engine-level DE session resource name (single session for the whole chat).
+    # Empty until the first answer_query turn; passed on subsequent turns to
+    # continue the multi-turn conversation.
+    de_session_name: Optional[str] = None
 
 
 @dataclass
@@ -43,5 +44,4 @@ class ChatResponse:
     session_id: str
     message: ChatMessage
     sources: List[RetrievedDocument] = field(default_factory=list)
-    # Whether the response was grounded by retrieved documents
     grounded: bool = False

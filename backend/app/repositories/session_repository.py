@@ -2,8 +2,8 @@
 Session repository: pluggable persistence backend for ChatSession objects.
 
 Two implementations:
-  - InMemorySessionRepository  (default; suitable for local dev and single-instance)
-  - RedisSessionRepository      (production; requires REDIS_URL env var)
+  - InMemorySessionRepository  (default; suitable for local dev / single-instance)
+  - RedisSessionRepository     (production; requires REDIS_URL env var)
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ class SessionRepository(ABC):
     def list_by_user(self, user_email: str) -> List[ChatSession]: ...
 
 
-# ── In-memory implementation ────────────────────────────────────────────────────
+# ── In-memory implementation ───────────────────────────────────────────────────
 
 class InMemorySessionRepository(SessionRepository):
     def __init__(self) -> None:
@@ -57,13 +57,10 @@ class InMemorySessionRepository(SessionRepository):
         return [s for s in self._store.values() if s.user_email == user_email]
 
 
-# ── Redis implementation ────────────────────────────────────────────────────────
+# ── Redis implementation ───────────────────────────────────────────────────────
 
 class RedisSessionRepository(SessionRepository):
-    """
-    Stores sessions as JSON in Redis with a TTL.
-    Requires `redis` package: pip install redis
-    """
+    """Stores sessions as JSON in Redis with a TTL."""
 
     def __init__(self, redis_url: str, ttl: int = 3600) -> None:
         import redis  # type: ignore[import]
@@ -114,7 +111,7 @@ def _session_to_dict(session: ChatSession) -> dict:
         "jd_code": session.jd_code,
         "created_at": session.created_at.isoformat(),
         "updated_at": session.updated_at.isoformat(),
-        "de_conversation_name": session.de_conversation_name,
+        "de_session_name": session.de_session_name,
         "messages": [
             {
                 "role": m.role.value,
@@ -173,11 +170,11 @@ def _session_from_dict(data: dict) -> ChatSession:
         messages=messages,
         created_at=datetime.fromisoformat(data["created_at"]),
         updated_at=datetime.fromisoformat(data["updated_at"]),
-        de_conversation_name=data.get("de_conversation_name"),
+        de_session_name=data.get("de_session_name"),
     )
 
 
-# ── Factory ─────────────────────────────────────────────────────────────────────
+# ── Factory ────────────────────────────────────────────────────────────────────
 
 _repository: Optional[SessionRepository] = None
 
