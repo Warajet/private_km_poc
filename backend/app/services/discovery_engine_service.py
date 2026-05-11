@@ -1,53 +1,59 @@
 """
-Discovery Engine (Vertex AI Search) service.
+DiscoveryEngineService — Layer 2 of the 2-layer access-control model.
 
-Handles:
-  - Grounded conversational search using Gemini Enterprise
-  - ACL-aware document retrieval (user identity passed in every request)
-  - JD-code post-filtering for CONFIDENTIAL documents
-  - Conversation lifecycle management (create / continue / delete)
+Responsibilities
+────────────────
+1. For each DatastoreTarget provided by the routing layer, build and execute
+   a Discovery Engine SearchRequest using the caller's impersonated credentials.
+2. Enforce the Layer-2 ACL gate: every request carries the impersonated GCP
+   identity so Discovery Engine can evaluate acl_info on each document.
+3. Apply the JD-code filter expression for CONFIDENTIAL targets.
+4. Run all per-target searches in parallel (ThreadPoolExecutor) and merge the
+   ranked results.
 
-ACL architecture:
-  Level       | Discovery Engine enforcement          | App layer
-  ────────────┼───────────────────────────────────────┼────────────────────────
-  PUBLIC      | No acl_info on document               | –
-  INTERNAL    | acl_info.readers: userId=dept@domain  | –
-  RELATE      | acl_info.readers: groupId=relate-*    | –
-  CONFIDENTIAL| acl_info.readers: userId=dept@domain  | jd_code check (below)
+What this service does NOT do
+──────────────────────────────
+- It does NOT decide which datastores to query (that is DatastoreRoutingService).
+- It does NOT generate the final answer (that is GeminiService).
+- It does NOT manage conversation sessions.
 
-For CONFIDENTIAL the ACL is set to the department email so DE returns the doc
-only to department members. The API then post-filters on structData.required_jd_code
-to enforce the finer-grained JD-code restriction.
+Per-bucket ACL setup expected in the datastores
+────────────────────────────────────────────────
+Bucket        acl_info on each document
+────────────  ────────────────────────────────────────────────────────────────
+PUBLIC        none (or readers: all)
+INTERNAL      readers: [{principals: [{userId: "<dept>@<domain>"}]}]
+RELATE        readers: [{principals: [{groupId: "relate-<id>@<domain>"}]}]
+CONFIDENTIAL  readers: [{principals: [{userId: "<dept>@<domain>"}]}]
+              + structData.required_jd_code: "<JD-CODE>"
 """
 
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Tuple
 
 from google.cloud import discoveryengine_v1 as discoveryengine
-from google.cloud.discoveryengine_v1.types import SearchResponse
 
 from app.config import Settings, get_settings
-from app.models.document import (
-    AclInfo,
-    AclPrincipal,
-    AclReader,
-    DocumentStructData,
-    RetrievedDocument,
-)
+from app.models.datastore import DatastoreTarget
+from app.models.document import DocumentStructData, RetrievedDocument
 from app.models.user import AccessLevel, GCPIdentity
 from app.utils.gcp_auth import get_impersonated_credentials
 
 logger = logging.getLogger(__name__)
 
+# Maximum documents fetched from each individual datastore per query
+_PER_DATASTORE_PAGE_SIZE = 10
+# Maximum documents passed on to the Gemini grounding step
+_MAX_MERGED_RESULTS = 20
+
 
 class DiscoveryEngineService:
     """
-    Wraps the Discovery Engine Conversational Search API.
-
-    A new instance is created per-request with the caller's impersonated
-    credentials so every API call is made under the correct user identity.
+    Manages search across multiple Discovery Engine datastores for a single
+    user identity.  One instance is created per-request by the controller.
     """
 
     def __init__(
@@ -57,149 +63,104 @@ class DiscoveryEngineService:
     ) -> None:
         self._settings = settings or get_settings()
         self._gcp_identity = gcp_identity
-        self._credentials = self._build_credentials()
-        self._conv_client = discoveryengine.ConversationalSearchServiceClient(
-            credentials=self._credentials
+        # Credentials are shared across all per-target searches in this request
+        self._credentials = get_impersonated_credentials(
+            target_email=gcp_identity.impersonated_email,
+            scopes=self._settings.dwd_scopes,
+            sa_key_file=self._settings.google_application_credentials,
         )
         self._search_client = discoveryengine.SearchServiceClient(
             credentials=self._credentials
         )
 
-    # ── Credentials ────────────────────────────────────────────────────────────
+    # ── Public API ─────────────────────────────────────────────────────────────
 
-    def _build_credentials(self):
-        return get_impersonated_credentials(
-            target_email=self._gcp_identity.impersonated_email,
-            scopes=self._settings.dwd_scopes,
-            sa_key_file=self._settings.google_application_credentials,
-        )
-
-    # ── Conversation management ────────────────────────────────────────────────
-
-    def create_conversation(self) -> str:
-        """
-        Create a new Discovery Engine conversation resource.
-        Returns the resource name (persisted on the ChatSession for multi-turn).
-        """
-        parent = self._settings.datastore_path
-        req = discoveryengine.CreateConversationRequest(
-            parent=parent,
-            conversation=discoveryengine.Conversation(),
-        )
-        conversation = self._conv_client.create_conversation(request=req)
-        logger.debug("Created DE conversation: %s", conversation.name)
-        return conversation.name
-
-    def delete_conversation(self, conversation_name: str) -> None:
-        """Clean up a conversation resource (call on session close)."""
-        try:
-            self._conv_client.delete_conversation(
-                request=discoveryengine.DeleteConversationRequest(name=conversation_name)
-            )
-        except Exception as exc:
-            logger.warning("Failed to delete conversation %s: %s", conversation_name, exc)
-
-    # ── Grounded conversational search ─────────────────────────────────────────
-
-    def converse(
-        self,
-        user_message: str,
-        conversation_name: str,
-        jd_code: Optional[str] = None,
-    ) -> Tuple[str, List[RetrievedDocument]]:
-        """
-        Send a message to an existing conversation and return
-        (answer_text, retrieved_documents).
-
-        The Discovery Engine automatically:
-          - Retrieves relevant documents from the datastore
-          - Filters documents by the caller's ACL (via impersonated credentials)
-          - Grounds the Gemini response on the retrieved passages
-        """
-        filter_expr = self._build_filter(jd_code)
-
-        query_spec = discoveryengine.ConverseConversationRequest.QueryUnderstandingSpec(
-            query_classification_spec=discoveryengine.ConverseConversationRequest.QueryUnderstandingSpec.QueryClassificationSpec(
-                types=[
-                    discoveryengine.ConverseConversationRequest.QueryUnderstandingSpec.QueryClassificationSpec.Type.ADVERSARIAL_QUERY,
-                    discoveryengine.ConverseConversationRequest.QueryUnderstandingSpec.QueryClassificationSpec.Type.NON_ANSWER_SEEKING_QUERY,
-                ]
-            )
-        )
-
-        search_spec = discoveryengine.ConverseConversationRequest.SearchSpec(
-            search_params=discoveryengine.ConverseConversationRequest.SearchSpec.SearchParams(
-                max_return_results=10,
-                filter=filter_expr,
-                boost_spec=discoveryengine.SearchRequest.BoostSpec(),
-            ),
-        )
-
-        request = discoveryengine.ConverseConversationRequest(
-            name=conversation_name,
-            query=discoveryengine.TextInput(input=user_message),
-            serving_config=self._settings.serving_config_path,
-            safe_search=True,
-            query_understanding_spec=query_spec,
-            search_spec=search_spec,
-            summary_spec=discoveryengine.SearchRequest.ContentSearchSpec.SummarySpec(
-                summary_result_count=5,
-                include_citations=True,
-                ignore_adversarial_query=True,
-                ignore_non_summary_seeking_query=True,
-                model_prompt_spec=discoveryengine.SearchRequest.ContentSearchSpec.SummarySpec.ModelPromptSpec(
-                    preamble=self._settings.gemini_system_prompt
-                ),
-                model_spec=discoveryengine.SearchRequest.ContentSearchSpec.SummarySpec.ModelSpec(
-                    version=self._settings.gemini_model,
-                ),
-            ),
-        )
-
-        response = self._conv_client.converse_conversation(request=request)
-
-        answer_text = ""
-        if response.reply and response.reply.summary:
-            answer_text = response.reply.summary.summary_text
-        elif response.reply:
-            answer_text = response.reply.reply
-
-        documents = self._extract_documents(response.search_results, jd_code)
-        return answer_text, documents
-
-    # ── Plain document search (non-conversational) ─────────────────────────────
-
-    def search(
+    def search_targets(
         self,
         query: str,
-        jd_code: Optional[str] = None,
-        page_size: int = 10,
+        targets: List[DatastoreTarget],
     ) -> List[RetrievedDocument]:
         """
-        One-shot search (no conversation context).
-        Useful for debug / admin endpoints.
+        Query every DatastoreTarget in parallel and return a merged, relevance-
+        ranked list of RetrievedDocuments (capped at _MAX_MERGED_RESULTS).
+
+        Each target is searched with the same impersonated credentials, so
+        Discovery Engine ACL sees a consistent identity across all buckets.
         """
-        filter_expr = self._build_filter(jd_code)
+        if not targets:
+            return []
+
+        all_docs: List[RetrievedDocument] = []
+
+        with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+            futures = {
+                pool.submit(self._search_single_target, query, target): target
+                for target in targets
+            }
+            for future in as_completed(futures):
+                target = futures[future]
+                try:
+                    docs = future.result()
+                    logger.debug(
+                        "Bucket %s returned %d docs", target.label, len(docs)
+                    )
+                    all_docs.extend(docs)
+                except Exception as exc:
+                    logger.error(
+                        "Search failed for bucket %s: %s",
+                        target.label,
+                        exc,
+                        exc_info=True,
+                    )
+
+        # Merge: sort by relevance descending, deduplicate by doc id
+        seen: set[str] = set()
+        merged: List[RetrievedDocument] = []
+        for doc in sorted(all_docs, key=lambda d: d.relevance_score, reverse=True):
+            if doc.id not in seen:
+                seen.add(doc.id)
+                merged.append(doc)
+            if len(merged) >= _MAX_MERGED_RESULTS:
+                break
+
+        logger.info(
+            "Multi-datastore search: %d targets → %d unique docs (top %d)",
+            len(targets),
+            len(merged),
+            _MAX_MERGED_RESULTS,
+        )
+        return merged
+
+    # ── Per-target search ──────────────────────────────────────────────────────
+
+    def _search_single_target(
+        self,
+        query: str,
+        target: DatastoreTarget,
+    ) -> List[RetrievedDocument]:
+        """Search one datastore bucket and return its documents."""
+        serving_config = self._serving_config_path(target.datastore_id)
+        filter_expr = self._build_filter(target)
 
         request = discoveryengine.SearchRequest(
-            serving_config=self._settings.serving_config_path,
+            serving_config=serving_config,
             query=query,
-            page_size=page_size,
-            filter=filter_expr,
+            page_size=_PER_DATASTORE_PAGE_SIZE,
+            filter=filter_expr or None,
+            # Pass the GCP identity so Discovery Engine can evaluate acl_info
             user_info=discoveryengine.UserInfo(
                 user_id=self._gcp_identity.impersonated_email,
             ),
             content_search_spec=discoveryengine.SearchRequest.ContentSearchSpec(
                 snippet_spec=discoveryengine.SearchRequest.ContentSearchSpec.SnippetSpec(
                     return_snippet=True,
-                    max_snippet_count=3,
+                    max_snippet_count=2,
                 ),
-                summary_spec=discoveryengine.SearchRequest.ContentSearchSpec.SummarySpec(
-                    summary_result_count=5,
-                    include_citations=True,
-                ),
-                extractive_content_spec=discoveryengine.SearchRequest.ContentSearchSpec.ExtractiveContentSpec(
-                    max_extractive_answer_count=3,
+                extractive_content_spec=(
+                    discoveryengine.SearchRequest.ContentSearchSpec.ExtractiveContentSpec(
+                        max_extractive_answer_count=2,
+                        max_extractive_segment_count=3,
+                    )
                 ),
             ),
             spell_correction_spec=discoveryengine.SearchRequest.SpellCorrectionSpec(
@@ -207,83 +168,53 @@ class DiscoveryEngineService:
             ),
         )
 
-        response: SearchResponse = self._search_client.search(request=request)
-        return self._extract_documents(response.results, jd_code)
+        response = self._search_client.search(request=request)
+        return self._parse_results(response.results, target)
 
     # ── Filter construction ────────────────────────────────────────────────────
 
-    def _build_filter(self, jd_code: Optional[str]) -> str:
+    def _build_filter(self, target: DatastoreTarget) -> str:
         """
-        Build a Discovery Engine filter expression that enforces the
-        authorization matrix at query time.
+        Build the Discovery Engine filter expression for this target.
 
-        The filter ensures:
-          - PUBLIC docs are always returned.
-          - INTERNAL docs are returned (DE ACL already restricts to the dept user).
-          - RELATE docs are returned (DE ACL restricts to relate group members).
-          - CONFIDENTIAL docs are returned ONLY if the user's jd_code matches.
+        PUBLIC / INTERNAL / RELATE — no additional filter (ACL is enforced by
+          the acl_info mechanism; user identity is passed via user_info).
 
-        Note: DE ACL (acl_info) enforces user_id/group_id at the index level.
-        This filter adds an extra JD-code gate for CONFIDENTIAL documents at
-        query time so we do not rely solely on GWS group membership.
+        CONFIDENTIAL — additionally restrict to the user's specific JD code AND
+          their department, so a Dept-A user cannot read Dept-B confidential docs
+          even if the datastore has mixed content.
         """
-        department = self._gcp_identity.department.upper()
+        if target.access_level != AccessLevel.CONFIDENTIAL:
+            return ""
 
-        if jd_code:
-            jd_upper = jd_code.upper()
-            # Return doc if: not confidential, OR confidential AND jd matches AND same dept
+        dept = self._gcp_identity.department.upper()
+        jd = (target.jd_code or "").upper()
+
+        if jd:
             return (
-                f'NOT structData.access_level: ANY("confidential") OR '
-                f'(structData.access_level: ANY("confidential") AND '
-                f' structData.department: ANY("{department}") AND '
-                f' structData.required_jd_code: ANY("{jd_upper}"))'
+                f'structData.department: ANY("{dept}") AND '
+                f'structData.required_jd_code: ANY("{jd}")'
             )
-        else:
-            # No jd_code → exclude all confidential docs
-            return 'NOT structData.access_level: ANY("confidential")'
+        # No JD code → exclude all confidential docs as a safety net
+        return 'structData.required_jd_code: ANY("")'  # matches nothing
 
-    # ── Response parsing ────────────────────────────────────────────────────────
+    # ── Result parsing ─────────────────────────────────────────────────────────
 
-    def _extract_documents(
+    def _parse_results(
         self,
         results,
-        jd_code: Optional[str],
+        target: DatastoreTarget,
     ) -> List[RetrievedDocument]:
-        """Convert raw DE search results to RetrievedDocument domain objects."""
-        documents: List[RetrievedDocument] = []
-
+        docs: List[RetrievedDocument] = []
         for result in results:
-            doc = result.document if hasattr(result, "document") else result
+            doc = getattr(result, "document", result)
             if doc is None:
                 continue
 
-            struct_data = self._parse_struct_data(doc)
+            struct_data = self._parse_struct_data(doc, target.access_level)
+            snippet = self._extract_snippet(result, doc)
 
-            # Application-layer JD-code gate for CONFIDENTIAL docs
-            if struct_data.access_level == AccessLevel.CONFIDENTIAL:
-                if not jd_code or not self._jd_code_matches(
-                    struct_data.required_jd_code, jd_code
-                ):
-                    logger.debug(
-                        "Post-filtered confidential doc %s (required=%s user_jd=%s)",
-                        doc.id,
-                        struct_data.required_jd_code,
-                        jd_code,
-                    )
-                    continue
-
-            snippet = ""
-            if hasattr(result, "chunk") and result.chunk:
-                snippet = result.chunk.content
-            elif doc.derived_struct_data:
-                snippets_field = doc.derived_struct_data.get("snippets")
-                if snippets_field and snippets_field.list_value.values:
-                    first = snippets_field.list_value.values[0]
-                    snippet = first.struct_value.fields.get("snippet", None)
-                    if snippet:
-                        snippet = snippet.string_value
-
-            documents.append(
+            docs.append(
                 RetrievedDocument(
                     id=doc.id or doc.name,
                     struct_data=struct_data,
@@ -292,12 +223,36 @@ class DiscoveryEngineService:
                     uri=struct_data.source_uri,
                 )
             )
+        return docs
 
-        return documents
+    def _extract_snippet(self, result, doc) -> str:
+        # Prefer extractive answers, then snippets, then nothing
+        if hasattr(result, "chunk") and result.chunk:
+            return result.chunk.content
 
-    def _parse_struct_data(self, doc) -> DocumentStructData:
-        """Parse structData fields from a Discovery Engine Document proto."""
-        sd = {}
+        derived = getattr(doc, "derived_struct_data", None)
+        if not derived:
+            return ""
+
+        snippets_field = derived.get("snippets")
+        if snippets_field and snippets_field.list_value.values:
+            first = snippets_field.list_value.values[0]
+            snippet_val = first.struct_value.fields.get("snippet")
+            if snippet_val:
+                return snippet_val.string_value
+
+        extractive_answers = derived.get("extractive_answers")
+        if extractive_answers and extractive_answers.list_value.values:
+            first = extractive_answers.list_value.values[0]
+            content_val = first.struct_value.fields.get("content")
+            if content_val:
+                return content_val.string_value
+
+        return ""
+
+    @staticmethod
+    def _parse_struct_data(doc, fallback_level: AccessLevel) -> DocumentStructData:
+        sd: dict = {}
         if doc.struct_data:
             for key, val in doc.struct_data.fields.items():
                 if val.HasField("string_value"):
@@ -307,11 +262,11 @@ class DiscoveryEngineService:
                 elif val.HasField("bool_value"):
                     sd[key] = val.bool_value
 
-        access_level_str = sd.get("access_level", "public").lower()
+        raw_level = sd.get("access_level", fallback_level.value).lower()
         try:
-            access_level = AccessLevel(access_level_str)
+            access_level = AccessLevel(raw_level)
         except ValueError:
-            access_level = AccessLevel.PUBLIC
+            access_level = fallback_level
 
         return DocumentStructData(
             title=sd.get("title", ""),
@@ -323,8 +278,20 @@ class DiscoveryEngineService:
             source_uri=sd.get("source_uri"),
         )
 
-    @staticmethod
-    def _jd_code_matches(required: Optional[str], provided: str) -> bool:
-        if not required:
-            return True
-        return required.upper() == provided.upper()
+    # ── Path helpers ───────────────────────────────────────────────────────────
+
+    def _serving_config_path(self, datastore_id: str) -> str:
+        return (
+            f"projects/{self._settings.gcp_project_id}"
+            f"/locations/{self._settings.gcp_location}"
+            f"/collections/default_collection"
+            f"/dataStores/{datastore_id}"
+            f"/servingConfigs/{self._settings.discovery_engine_serving_config_id}"
+        )
+
+    # ── Expose credentials for GeminiService ──────────────────────────────────
+
+    @property
+    def credentials(self):
+        """Expose the impersonated credentials so GeminiService can reuse them."""
+        return self._credentials

@@ -1,15 +1,30 @@
 """
-Chat controller: orchestrates a chat turn end-to-end.
+ChatController — orchestrates a complete chat turn end-to-end.
 
-Flow per chat turn:
-  1. Get or create a ChatSession for the user.
-  2. Record the incoming user message.
-  3. Build impersonated GCP credentials for the user's department identity.
-  4. Ensure the session has a Discovery Engine conversation resource.
-  5. Call DiscoveryEngineService.converse() — retrieves ACL-filtered docs and
-     generates a grounded Gemini response.
-  6. Append the assistant message (with source citations) to the session.
-  7. Return a ChatResponse.
+Two-layer access-control flow per turn
+───────────────────────────────────────
+ ┌─────────────────────────────────────────────────────────────────────────┐
+ │  LAYER 1 — API Routing  (DatastoreRoutingService)                       │
+ │  Decides WHICH datastore buckets to query based on user identity:       │
+ │    PUBLIC  → always                                                     │
+ │    INTERNAL→ user's own department bucket only                          │
+ │    RELATE  → only relate-group buckets the user belongs to              │
+ │    CONFID. → confidential bucket, only if user has a JD code            │
+ └───────────────────────────────────┬─────────────────────────────────────┘
+                                     │  List[DatastoreTarget]
+ ┌───────────────────────────────────▼─────────────────────────────────────┐
+ │  LAYER 2 — ACL Enforcement  (DiscoveryEngineService)                    │
+ │  Queries each target in parallel with impersonated credentials.         │
+ │  Discovery Engine evaluates acl_info on every document, ensuring each  │
+ │  bucket's contents are only visible to authorised identities.           │
+ │  CONFIDENTIAL target also carries a JD-code filter expression.         │
+ └───────────────────────────────────┬─────────────────────────────────────┘
+                                     │  List[RetrievedDocument] (merged)
+ ┌───────────────────────────────────▼─────────────────────────────────────┐
+ │  GeminiService — grounded response generation                           │
+ │  Builds a grounded prompt from the retrieved docs + conversation        │
+ │  history and calls Gemini via Vertex AI (same impersonated creds).      │
+ └─────────────────────────────────────────────────────────────────────────┘
 """
 
 from __future__ import annotations
@@ -28,7 +43,9 @@ from app.schemas.chat import (
     SessionResponse,
     SourceDocument,
 )
+from app.services.datastore_routing_service import DatastoreRoutingService
 from app.services.discovery_engine_service import DiscoveryEngineService
+from app.services.gemini_service import GeminiService
 from app.services.session_service import SessionService
 
 logger = logging.getLogger(__name__)
@@ -46,7 +63,9 @@ class ChatController:
     # ── Chat turn ──────────────────────────────────────────────────────────────
 
     def chat(self, request: ChatRequest, user_context: UserContext) -> ChatResponse:
-        """Execute a single chat turn and return the assistant response."""
+        """Execute one chat turn and return the grounded assistant response."""
+
+        # ── 1. Resolve / create session ────────────────────────────────────────
         try:
             session = self._session_service.get_or_create_session(
                 user_context, request.session_id
@@ -56,50 +75,68 @@ class ChatController:
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
-        # Record incoming message
+        # ── 2. Persist user message ────────────────────────────────────────────
         self._session_service.append_user_message(session, request.message)
 
-        # Build the DE service scoped to this user's identity
+        # ── 3. Layer 1: determine accessible datastore buckets ─────────────────
+        try:
+            routing_service = DatastoreRoutingService()
+            targets = routing_service.resolve_targets(user_context)
+        except RuntimeError as exc:
+            # Registry not initialised — configuration error
+            logger.error("Datastore registry not initialised: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Knowledge base registry is not configured. Contact your administrator.",
+            ) from exc
+
+        logger.info(
+            "User %s → %d accessible buckets: %s",
+            user_context.hwc_user.email,
+            len(targets),
+            [t.label for t in targets],
+        )
+
+        # ── 4. Layer 2: parallel search across all accessible datastores ───────
         de_service = DiscoveryEngineService(
             gcp_identity=user_context.gcp_identity,
             settings=self._settings,
         )
 
-        # Ensure a DE conversation exists for multi-turn continuity
-        if not session.de_conversation_name:
-            try:
-                conv_name = de_service.create_conversation()
-                self._session_service.set_de_conversation(session, conv_name)
-            except Exception as exc:
-                logger.error("Failed to create DE conversation: %s", exc)
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail="Could not initialise conversation with the knowledge base.",
-                ) from exc
-
-        # Call Gemini Enterprise via Discovery Engine
         try:
-            answer_text, documents = de_service.converse(
-                user_message=request.message,
-                conversation_name=session.de_conversation_name,
-                jd_code=user_context.gcp_identity.jd_code or None,
+            retrieved_docs = de_service.search_targets(
+                query=request.message,
+                targets=targets,
             )
         except Exception as exc:
-            logger.error("Discovery Engine error: %s", exc, exc_info=True)
+            logger.error("Discovery Engine search error: %s", exc, exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Error retrieving answer from the knowledge base.",
+                detail="Error retrieving documents from the knowledge base.",
             ) from exc
 
-        if not answer_text:
-            answer_text = (
-                "I could not find relevant information in the knowledge base "
-                "for your query. Please try rephrasing or contact your administrator."
+        # ── 5. Generate grounded Gemini response ───────────────────────────────
+        try:
+            gemini = GeminiService(
+                gcp_identity=user_context.gcp_identity,
+                credentials=de_service.credentials,
+                settings=self._settings,
             )
+            answer_text = gemini.generate(
+                user_message=request.message,
+                history=session.messages[:-1],  # exclude the just-appended user msg
+                retrieved_docs=retrieved_docs,
+            )
+        except Exception as exc:
+            logger.error("Gemini generation error: %s", exc, exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Error generating response from the AI model.",
+            ) from exc
 
-        # Persist assistant message with source citations
+        # ── 6. Persist assistant message ───────────────────────────────────────
         assistant_msg = self._session_service.append_assistant_message(
-            session, answer_text, documents
+            session, answer_text, retrieved_docs
         )
 
         sources = [
@@ -112,7 +149,7 @@ class ChatController:
                 uri=doc.uri,
                 relevance_score=doc.relevance_score,
             )
-            for doc in documents
+            for doc in retrieved_docs
         ]
 
         return ChatResponse(
@@ -123,7 +160,7 @@ class ChatController:
                 timestamp=assistant_msg.timestamp,
                 sources=sources,
             ),
-            grounded=len(documents) > 0,
+            grounded=len(retrieved_docs) > 0,
         )
 
     # ── Session management ─────────────────────────────────────────────────────
@@ -174,7 +211,7 @@ class ChatController:
 
     def delete_session(self, session_id: str, user_context: UserContext) -> None:
         try:
-            session = self._session_service.get_session(
+            self._session_service.get_session(
                 session_id, user_context.hwc_user.email
             )
         except ValueError as exc:
@@ -182,15 +219,20 @@ class ChatController:
         except PermissionError as exc:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
 
-        # Clean up the Discovery Engine conversation resource
-        if session.de_conversation_name:
-            de_service = DiscoveryEngineService(
-                gcp_identity=user_context.gcp_identity,
-                settings=self._settings,
-            )
-            de_service.delete_conversation(session.de_conversation_name)
-
         self._session_service.delete_session(session_id, user_context.hwc_user.email)
+
+    # ── Access introspection (debug endpoint) ──────────────────────────────────
+
+    def describe_access(self, user_context: UserContext) -> dict:
+        """
+        Returns which datastores this user can query and why.
+        Useful for debugging ACL issues during onboarding.
+        """
+        try:
+            routing_service = DatastoreRoutingService()
+            return routing_service.describe_access(user_context)
+        except RuntimeError:
+            return {"error": "Registry not initialised"}
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 

@@ -34,8 +34,13 @@ def _controller(settings: Settings = Depends(get_settings)) -> ChatController:
     description=(
         "Send a message to the knowledge-base chatbot. "
         "Provide `session_id` to continue an existing conversation; "
-        "omit it to start a new one. "
-        "Responses are grounded on documents the user is authorised to access."
+        "omit it to start a new one.\n\n"
+        "**Two-layer access control** is applied automatically:\n"
+        "- **Layer 1 (API)**: only the datastores the user's identity is "
+        "authorised to query are selected (Public, Internal-dept, Relate-groups, "
+        "Confidential-if-JD-code).\n"
+        "- **Layer 2 (ACL)**: within each selected datastore, Discovery Engine "
+        "evaluates `acl_info` against the impersonated GCP identity."
     ),
 )
 def send_message(
@@ -98,3 +103,28 @@ def delete_session(
     controller: ChatController = Depends(_controller),
 ):
     controller.delete_session(session_id, user_context)
+
+
+# ── Debug / introspection ───────────────────────────────────────────────────────
+
+@router.get(
+    "/access",
+    summary="Describe accessible datastores for the current user",
+    description=(
+        "Returns which datastore buckets this user can query and why. "
+        "Useful for debugging access issues. "
+        "Only available when DEBUG=true."
+    ),
+)
+def describe_access(
+    user_context: UserContext = Depends(get_user_context),
+    controller: ChatController = Depends(_controller),
+    settings: Settings = Depends(get_settings),
+):
+    if not settings.debug:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not found",
+        )
+    return controller.describe_access(user_context)

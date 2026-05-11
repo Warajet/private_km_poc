@@ -40,15 +40,29 @@ class Settings(BaseSettings):
 
     # ── GCP Core ───────────────────────────────────────────────────────────────
     gcp_project_id: str
+    # Use "global" for Discovery Engine; GeminiService maps "global" → "us-central1"
+    # for Vertex AI which requires a regional location.
     gcp_location: str = "global"
+    # Vertex AI region used by GeminiService (separate from DE location).
+    vertex_ai_location: str = "us-central1"
 
-    # ── Discovery Engine / Vertex AI Search ────────────────────────────────────
-    # Format: projects/{project}/locations/{location}/collections/{collection}/dataStores/{datastore}
-    discovery_engine_datastore_id: str
+    # ── Discovery Engine ───────────────────────────────────────────────────────
+    # Serving config ID is shared across all buckets (each datastore gets its own).
     discovery_engine_serving_config_id: str = "default_config"
 
+    # ── Datastore Registry ─────────────────────────────────────────────────────
+    # Path to a JSON file that maps bucket type → datastore ID(s).
+    # See scripts/datastore_registry.json for the schema.
+    #
+    # {
+    #   "public":       "public-datastore-id",
+    #   "internal":     { "A": "internal-dept-a-id", "B": "internal-dept-b-id" },
+    #   "relate":       { "ab": "relate-ab-id", "abc": "relate-abc-id" },
+    #   "confidential": "confidential-datastore-id"
+    # }
+    datastore_registry_file: Optional[str] = None
+
     # ── Gemini Enterprise ──────────────────────────────────────────────────────
-    # Leave empty to use the datastore's default model
     gemini_model: str = "gemini-2.0-flash-001"
     gemini_system_prompt: str = (
         "You are a helpful enterprise knowledge assistant. "
@@ -75,24 +89,21 @@ class Settings(BaseSettings):
     redis_url: Optional[str] = None
     session_ttl_seconds: int = 3600
 
-    # ── Authorization ──────────────────────────────────────────────────────────
-    # Internal email pattern for department-level impersonation.
+    # ── Authorization email templates ──────────────────────────────────────────
     # {department}@{workspace_domain}  →  e.g. A@hello.org
     department_email_template: str = "{department}@{workspace_domain}"
-
-    # Group email templates used in Discovery Engine ACL
+    # GWS group emails used in acl_info (set during document ingestion)
     relate_group_email_template: str = "relate-{relate_id}@{workspace_domain}"
     jd_group_email_template: str = "jd-{jd_code}@{workspace_domain}"
 
-    # ── JWT for Frontend ↔ Backend communication ───────────────────────────────
+    # ── JWT for Frontend ↔ Backend ─────────────────────────────────────────────
     jwt_secret: str = "change-this-in-production"
     jwt_algorithm: str = "HS256"
     jwt_expiry_minutes: int = 60
 
-    # ── User ↔ Department Mapping (override via JSON file for large orgs) ───────
-    # Maps "userA@hello.org" → {"department": "A", "jd_code": "ENG001"}
-    # In production, load this from a DB or Google Directory instead.
-    user_mapping_file: Optional[str] = None  # path to JSON mapping file
+    # ── User ↔ Department Mapping ───────────────────────────────────────────────
+    # Maps HWC email → {"department": "A", "jd_code": "ENG001", ...}
+    user_mapping_file: Optional[str] = None
 
     @field_validator("allowed_origins", mode="before")
     @classmethod
@@ -125,25 +136,6 @@ class Settings(BaseSettings):
         return self.jd_group_email_template.format(
             jd_code=jd_code.lower(),
             workspace_domain=self.workspace_domain,
-        )
-
-    @property
-    def serving_config_path(self) -> str:
-        return (
-            f"projects/{self.gcp_project_id}"
-            f"/locations/{self.gcp_location}"
-            f"/collections/default_collection"
-            f"/dataStores/{self.discovery_engine_datastore_id}"
-            f"/servingConfigs/{self.discovery_engine_serving_config_id}"
-        )
-
-    @property
-    def datastore_path(self) -> str:
-        return (
-            f"projects/{self.gcp_project_id}"
-            f"/locations/{self.gcp_location}"
-            f"/collections/default_collection"
-            f"/dataStores/{self.discovery_engine_datastore_id}"
         )
 
 
