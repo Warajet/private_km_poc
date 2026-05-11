@@ -1,0 +1,23 @@
+# FastAPI framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.12
+
+# Settings management
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# JWT
+PyJWT==2.10.1
+
+# Google Cloud
+google-cloud-discoveryengine==0.13.4
+google-auth==2.37.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
+
+# Optional: Redis session backend
+redis==5.2.1
+
+# HTTP client (used by google-auth)
+httpx==0.28.1
