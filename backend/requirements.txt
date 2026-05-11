@@ -10,12 +10,8 @@ pydantic-settings==2.6.1
 # JWT
 PyJWT==2.10.1
 
-# Google Cloud — Discovery Engine (Vertex AI Search)
+# Google Cloud — Discovery Engine (Vertex AI Search) with answer_query API
 google-cloud-discoveryengine==0.13.4
-
-# Google Cloud — Vertex AI / Gemini Enterprise
-google-cloud-aiplatform==1.74.0
-vertexai==1.74.0
 
 # Google auth + Domain-wide Delegation
 google-auth==2.37.0

@@ -1,30 +1,37 @@
 """
 ChatController — orchestrates a complete chat turn end-to-end.
 
-Two-layer access-control flow per turn
-───────────────────────────────────────
+answer_query() flow per turn
+──────────────────────────────
  ┌─────────────────────────────────────────────────────────────────────────┐
  │  LAYER 1 — API Routing  (DatastoreRoutingService)                       │
- │  Decides WHICH datastore buckets to query based on user identity:       │
- │    PUBLIC  → always                                                     │
- │    INTERNAL→ user's own department bucket only                          │
- │    RELATE  → only relate-group buckets the user belongs to              │
- │    CONFID. → confidential bucket, only if user has a JD code            │
+ │  Selects which datastore buckets to query.                              │
  └───────────────────────────────────┬─────────────────────────────────────┘
                                      │  List[DatastoreTarget]
  ┌───────────────────────────────────▼─────────────────────────────────────┐
- │  LAYER 2 — ACL Enforcement  (DiscoveryEngineService)                    │
- │  Queries each target in parallel with impersonated credentials.         │
- │  Discovery Engine evaluates acl_info on every document, ensuring each  │
- │  bucket's contents are only visible to authorised identities.           │
- │  CONFIDENTIAL target also carries a JD-code filter expression.         │
+ │  LAYER 2 — answer_query()  (DiscoveryEngineService)                     │
+ │                                                                         │
+ │  For each target:                                                       │
+ │    ConversationalSearchServiceClient.answer_query(                      │
+ │        serving_config = <bucket-datastore-serving-config>,              │
+ │        query          = Query(text=user_message),                       │
+ │        session        = de_sessions[datastore_id],  # multi-turn       │
+ │        user_pseudo_id = impersonated_email,                             │
+ │        ...                                                              │
+ │    )                                                                    │
+ │                                                                         │
+ │  → Discovery Engine enforces acl_info against impersonated credentials │
+ │  → Gemini generates a grounded answer from retrieved documents         │
+ │  → Response.session contains the updated session name                  │
  └───────────────────────────────────┬─────────────────────────────────────┘
-                                     │  List[RetrievedDocument] (merged)
+                                     │  AggregatedAnswer
  ┌───────────────────────────────────▼─────────────────────────────────────┐
- │  GeminiService — grounded response generation                           │
- │  Builds a grounded prompt from the retrieved docs + conversation        │
- │  history and calls Gemini via Vertex AI (same impersonated creds).      │
+ │  Session update                                                         │
+ │  Store updated DE session names so next turn continues each conversation│
  └─────────────────────────────────────────────────────────────────────────┘
+
+No separate GeminiService exists. answer_query() handles both retrieval and
+answer generation in a single API call.
 """
 
 from __future__ import annotations
@@ -45,7 +52,6 @@ from app.schemas.chat import (
 )
 from app.services.datastore_routing_service import DatastoreRoutingService
 from app.services.discovery_engine_service import DiscoveryEngineService
-from app.services.gemini_service import GeminiService
 from app.services.session_service import SessionService
 
 logger = logging.getLogger(__name__)
@@ -63,7 +69,7 @@ class ChatController:
     # ── Chat turn ──────────────────────────────────────────────────────────────
 
     def chat(self, request: ChatRequest, user_context: UserContext) -> ChatResponse:
-        """Execute one chat turn and return the grounded assistant response."""
+        """Execute one chat turn via answer_query() and return the response."""
 
         # ── 1. Resolve / create session ────────────────────────────────────────
         try:
@@ -80,10 +86,9 @@ class ChatController:
 
         # ── 3. Layer 1: determine accessible datastore buckets ─────────────────
         try:
-            routing_service = DatastoreRoutingService()
-            targets = routing_service.resolve_targets(user_context)
+            routing = DatastoreRoutingService()
+            targets = routing.resolve_targets(user_context)
         except RuntimeError as exc:
-            # Registry not initialised — configuration error
             logger.error("Datastore registry not initialised: %s", exc)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -97,46 +102,42 @@ class ChatController:
             [t.label for t in targets],
         )
 
-        # ── 4. Layer 2: parallel search across all accessible datastores ───────
+        # ── 4. Layer 2: answer_query() across all accessible datastores ────────
         de_service = DiscoveryEngineService(
             gcp_identity=user_context.gcp_identity,
             settings=self._settings,
         )
 
         try:
-            retrieved_docs = de_service.search_targets(
+            aggregated = de_service.answer_all_targets(
                 query=request.message,
                 targets=targets,
+                # Pass existing DE session names so answer_query() continues
+                # the multi-turn conversation within each datastore bucket.
+                de_sessions=session.de_sessions,
             )
         except Exception as exc:
-            logger.error("Discovery Engine search error: %s", exc, exc_info=True)
+            logger.error("answer_query error: %s", exc, exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Error retrieving documents from the knowledge base.",
+                detail="Error retrieving answer from the knowledge base.",
             ) from exc
 
-        # ── 5. Generate grounded Gemini response ───────────────────────────────
-        try:
-            gemini = GeminiService(
-                gcp_identity=user_context.gcp_identity,
-                credentials=de_service.credentials,
-                settings=self._settings,
+        # ── 5. Persist updated DE session names for next turn ──────────────────
+        if aggregated.updated_de_sessions:
+            self._session_service.update_de_sessions(
+                session, aggregated.updated_de_sessions
             )
-            answer_text = gemini.generate(
-                user_message=request.message,
-                history=session.messages[:-1],  # exclude the just-appended user msg
-                retrieved_docs=retrieved_docs,
-            )
-        except Exception as exc:
-            logger.error("Gemini generation error: %s", exc, exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Error generating response from the AI model.",
-            ) from exc
 
-        # ── 6. Persist assistant message ───────────────────────────────────────
+        # ── 6. Fallback answer when knowledge base has nothing ─────────────────
+        answer_text = aggregated.answer_text or (
+            "I could not find relevant information in the knowledge base for your query. "
+            "Please try rephrasing or contact your administrator."
+        )
+
+        # ── 7. Persist assistant message with source citations ─────────────────
         assistant_msg = self._session_service.append_assistant_message(
-            session, answer_text, retrieved_docs
+            session, answer_text, aggregated.references
         )
 
         sources = [
@@ -149,7 +150,7 @@ class ChatController:
                 uri=doc.uri,
                 relevance_score=doc.relevance_score,
             )
-            for doc in retrieved_docs
+            for doc in aggregated.references
         ]
 
         return ChatResponse(
@@ -160,7 +161,7 @@ class ChatController:
                 timestamp=assistant_msg.timestamp,
                 sources=sources,
             ),
-            grounded=len(retrieved_docs) > 0,
+            grounded=aggregated.grounded,
         )
 
     # ── Session management ─────────────────────────────────────────────────────
@@ -221,16 +222,13 @@ class ChatController:
 
         self._session_service.delete_session(session_id, user_context.hwc_user.email)
 
-    # ── Access introspection (debug endpoint) ──────────────────────────────────
+    # ── Access introspection ───────────────────────────────────────────────────
 
     def describe_access(self, user_context: UserContext) -> dict:
-        """
-        Returns which datastores this user can query and why.
-        Useful for debugging ACL issues during onboarding.
-        """
+        """Returns which datastores this user can query. Debug only."""
         try:
-            routing_service = DatastoreRoutingService()
-            return routing_service.describe_access(user_context)
+            routing = DatastoreRoutingService()
+            return routing.describe_access(user_context)
         except RuntimeError:
             return {"error": "Registry not initialised"}
 

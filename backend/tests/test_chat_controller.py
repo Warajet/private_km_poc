@@ -9,10 +9,11 @@ import pytest
 
 from app.controllers.chat_controller import ChatController
 from app.models.chat import ChatMessage, ChatSession, MessageRole
-from app.models.datastore import DatastoreRegistry, DatastoreTarget
+from app.models.datastore import DatastoreTarget
 from app.models.document import DocumentStructData, RetrievedDocument
 from app.models.user import AccessLevel, GCPIdentity, HWCUser, UserContext
 from app.schemas.chat import ChatRequest
+from app.services.discovery_engine_service import AggregatedAnswer
 
 
 @pytest.fixture(autouse=True)
@@ -50,6 +51,7 @@ def mock_session():
         user_email="userA@hello.org",
         department="A",
         jd_code="ENG001",
+        de_sessions={},
     )
 
 
@@ -71,16 +73,6 @@ def mock_session_service(mock_session):
 
 
 @pytest.fixture()
-def mock_registry():
-    return DatastoreRegistry(
-        public_datastore_id="ds-public",
-        internal_datastores={"A": "ds-internal-a"},
-        relate_datastores={"ab": "ds-relate-ab"},
-        confidential_datastore_id="ds-confidential",
-    )
-
-
-@pytest.fixture()
 def retrieved_docs():
     return [
         RetrievedDocument(
@@ -97,28 +89,27 @@ def retrieved_docs():
 
 
 class TestChatController:
-    def _patch_all(self, mock_session_service, mock_registry, retrieved_docs, answer="Here is the answer."):
-        de_patch = patch("app.controllers.chat_controller.DiscoveryEngineService")
-        gemini_patch = patch("app.controllers.chat_controller.GeminiService")
-        routing_patch = patch("app.controllers.chat_controller.DatastoreRoutingService")
 
-        return de_patch, gemini_patch, routing_patch
-
-    def test_chat_returns_response(
-        self, user_context, mock_session_service, mock_registry, retrieved_docs
+    def test_chat_returns_grounded_response(
+        self, user_context, mock_session_service, retrieved_docs
     ):
+        """answer_query() returns a grounded answer with references."""
+        aggregated = AggregatedAnswer(
+            answer_text="Here is the answer based on documents.",
+            references=retrieved_docs,
+            updated_de_sessions={"ds-internal-a": "projects/p/dataStores/ds/sessions/s1"},
+            grounded=True,
+        )
+
         with (
             patch("app.controllers.chat_controller.DiscoveryEngineService") as MockDE,
-            patch("app.controllers.chat_controller.GeminiService") as MockGemini,
             patch("app.controllers.chat_controller.DatastoreRoutingService") as MockRouting,
         ):
             MockRouting.return_value.resolve_targets.return_value = [
                 DatastoreTarget("ds-public", AccessLevel.PUBLIC, label="public"),
                 DatastoreTarget("ds-internal-a", AccessLevel.INTERNAL, label="internal-A"),
             ]
-            MockDE.return_value.search_targets.return_value = retrieved_docs
-            MockDE.return_value.credentials = MagicMock()
-            MockGemini.return_value.generate.return_value = "Here is the answer."
+            MockDE.return_value.answer_all_targets.return_value = aggregated
 
             controller = ChatController(session_service=mock_session_service)
             response = controller.chat(
@@ -127,62 +118,110 @@ class TestChatController:
             )
 
         assert response.session_id == "session-123"
-        assert response.message.content == "Here is the answer."
+        assert response.message.content == "Here is the answer based on documents."
         assert response.grounded is True
         assert len(response.message.sources) == 1
         assert response.message.sources[0].title == "Test Document"
         assert response.message.sources[0].access_level == "internal"
 
-    def test_chat_queries_correct_number_of_targets(
+    def test_chat_passes_de_sessions_from_chat_session(
+        self, user_context, mock_session_service
+    ):
+        """Existing DE session names are forwarded to answer_all_targets()."""
+        existing_sessions = {"ds-public": "projects/p/dataStores/ds/sessions/existing"}
+        mock_session_service.get_or_create_session.return_value.de_sessions = existing_sessions
+
+        with (
+            patch("app.controllers.chat_controller.DiscoveryEngineService") as MockDE,
+            patch("app.controllers.chat_controller.DatastoreRoutingService") as MockRouting,
+        ):
+            MockRouting.return_value.resolve_targets.return_value = [
+                DatastoreTarget("ds-public", AccessLevel.PUBLIC, label="public"),
+            ]
+            MockDE.return_value.answer_all_targets.return_value = AggregatedAnswer(
+                answer_text="Answer.", references=[], updated_de_sessions={}, grounded=False
+            )
+
+            controller = ChatController(session_service=mock_session_service)
+            controller.chat(ChatRequest(message="Hello"), user_context)
+
+            call_kwargs = MockDE.return_value.answer_all_targets.call_args[1]
+            assert call_kwargs["de_sessions"] == existing_sessions
+
+    def test_chat_updates_de_sessions_after_response(
+        self, user_context, mock_session_service
+    ):
+        """Updated session names from DE are persisted on the ChatSession."""
+        new_sessions = {"ds-internal-a": "projects/p/sessions/new-session"}
+
+        with (
+            patch("app.controllers.chat_controller.DiscoveryEngineService") as MockDE,
+            patch("app.controllers.chat_controller.DatastoreRoutingService") as MockRouting,
+        ):
+            MockRouting.return_value.resolve_targets.return_value = [
+                DatastoreTarget("ds-internal-a", AccessLevel.INTERNAL, label="internal-A"),
+            ]
+            MockDE.return_value.answer_all_targets.return_value = AggregatedAnswer(
+                answer_text="Answer.",
+                references=[],
+                updated_de_sessions=new_sessions,
+                grounded=False,
+            )
+
+            controller = ChatController(session_service=mock_session_service)
+            controller.chat(ChatRequest(message="Follow-up"), user_context)
+
+        mock_session_service.update_de_sessions.assert_called_once()
+        _, stored_sessions = mock_session_service.update_de_sessions.call_args[0]
+        assert stored_sessions == new_sessions
+
+    def test_chat_all_four_buckets_queried(
         self, user_context, mock_session_service, retrieved_docs
     ):
-        """Routing service resolves 4 targets; DE receives all 4."""
+        """Controller passes all 4 target types to answer_all_targets()."""
         four_targets = [
             DatastoreTarget("ds-public", AccessLevel.PUBLIC, label="public"),
             DatastoreTarget("ds-internal-a", AccessLevel.INTERNAL, label="internal-A"),
             DatastoreTarget("ds-relate-ab", AccessLevel.RELATE, label="relate-ab"),
             DatastoreTarget("ds-confidential", AccessLevel.CONFIDENTIAL, jd_code="ENG001", label="confidential"),
         ]
+
         with (
             patch("app.controllers.chat_controller.DiscoveryEngineService") as MockDE,
-            patch("app.controllers.chat_controller.GeminiService") as MockGemini,
             patch("app.controllers.chat_controller.DatastoreRoutingService") as MockRouting,
         ):
             MockRouting.return_value.resolve_targets.return_value = four_targets
-            MockDE.return_value.search_targets.return_value = retrieved_docs
-            MockDE.return_value.credentials = MagicMock()
-            MockGemini.return_value.generate.return_value = "Answer."
+            MockDE.return_value.answer_all_targets.return_value = AggregatedAnswer(
+                answer_text="Answer.", references=retrieved_docs,
+                updated_de_sessions={}, grounded=True,
+            )
 
             controller = ChatController(session_service=mock_session_service)
-            controller.chat(ChatRequest(message="Tell me everything"), user_context)
+            controller.chat(ChatRequest(message="Everything"), user_context)
 
-            call_targets = MockDE.return_value.search_targets.call_args[1]["targets"]
+            call_targets = MockDE.return_value.answer_all_targets.call_args[1]["targets"]
             assert len(call_targets) == 4
 
-    def test_chat_fallback_message_when_no_docs_retrieved(
-        self, user_context, mock_session_service
-    ):
+    def test_chat_fallback_when_no_answer(self, user_context, mock_session_service):
+        """Empty answer_text produces a fallback message; grounded=False."""
         with (
             patch("app.controllers.chat_controller.DiscoveryEngineService") as MockDE,
-            patch("app.controllers.chat_controller.GeminiService") as MockGemini,
             patch("app.controllers.chat_controller.DatastoreRoutingService") as MockRouting,
         ):
             MockRouting.return_value.resolve_targets.return_value = [
                 DatastoreTarget("ds-public", AccessLevel.PUBLIC, label="public"),
             ]
-            MockDE.return_value.search_targets.return_value = []
-            MockDE.return_value.credentials = MagicMock()
-            MockGemini.return_value.generate.return_value = (
-                "No relevant information found in your authorised documents."
+            MockDE.return_value.answer_all_targets.return_value = AggregatedAnswer(
+                answer_text="", references=[], updated_de_sessions={}, grounded=False
             )
 
             controller = ChatController(session_service=mock_session_service)
             response = controller.chat(
-                ChatRequest(message="Unanswerable?"), user_context
+                ChatRequest(message="Unanswerable"), user_context
             )
 
         assert response.grounded is False
-        assert len(response.message.sources) == 0
+        assert "could not find" in response.message.content.lower()
 
     def test_registry_not_initialised_returns_503(
         self, user_context, mock_session_service
@@ -191,8 +230,8 @@ class TestChatController:
             MockRouting.return_value.resolve_targets.side_effect = RuntimeError(
                 "DatastoreRegistry not initialised"
             )
-            controller = ChatController(session_service=mock_session_service)
             from fastapi import HTTPException
+            controller = ChatController(session_service=mock_session_service)
             with pytest.raises(HTTPException) as exc_info:
                 controller.chat(ChatRequest(message="Hello"), user_context)
             assert exc_info.value.status_code == 503
@@ -205,10 +244,10 @@ class TestChatController:
             MockRouting.return_value.resolve_targets.return_value = [
                 DatastoreTarget("ds-public", AccessLevel.PUBLIC, label="public"),
             ]
-            MockDE.return_value.search_targets.side_effect = Exception("GCP unavailable")
+            MockDE.return_value.answer_all_targets.side_effect = Exception("GCP unavailable")
 
-            controller = ChatController(session_service=mock_session_service)
             from fastapi import HTTPException
+            controller = ChatController(session_service=mock_session_service)
             with pytest.raises(HTTPException) as exc_info:
                 controller.chat(ChatRequest(message="Hello"), user_context)
             assert exc_info.value.status_code == 502

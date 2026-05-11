@@ -1,16 +1,11 @@
-"""
-Chat session service.
-
-Manages session lifecycle (create / get / update / delete) and delegates
-persistence to the session repository.
-"""
+"""Chat session service."""
 
 from __future__ import annotations
 
 import logging
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from app.config import Settings, get_settings
 from app.models.chat import ChatMessage, ChatSession, MessageRole
@@ -41,7 +36,7 @@ class SessionService:
             jd_code=user_context.hwc_user.jd_code,
         )
         self._repo.save(session)
-        logger.info("Created session %s for user %s", session_id, user_context.hwc_user.email)
+        logger.info("Created session %s for %s", session_id, user_context.hwc_user.email)
         return session
 
     def get_session(self, session_id: str, user_email: str) -> ChatSession:
@@ -94,6 +89,18 @@ class SessionService:
         self._repo.save(session)
         return msg
 
-    def set_de_conversation(self, session: ChatSession, conversation_name: str) -> None:
-        session.de_conversation_name = conversation_name
+    # ── Discovery Engine session tracking ──────────────────────────────────────
+
+    def update_de_sessions(
+        self,
+        session: ChatSession,
+        updated_sessions: Dict[str, str],
+    ) -> None:
+        """
+        Merge new/updated Discovery Engine session resource names into the
+        ChatSession.  updated_sessions maps datastore_id → de_session_name.
+        Called after each answer_query turn to persist the returned session names
+        so that subsequent turns can continue the DE conversations.
+        """
+        session.de_sessions.update(updated_sessions)
         self._repo.save(session)
