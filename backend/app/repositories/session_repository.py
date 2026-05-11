@@ -111,8 +111,7 @@ def _session_to_dict(session: ChatSession) -> dict:
         "jd_code": session.jd_code,
         "created_at": session.created_at.isoformat(),
         "updated_at": session.updated_at.isoformat(),
-        # DE session resource names keyed by datastore_id
-        "de_sessions": session.de_sessions,
+        "de_session_name": session.de_session_name,
         "messages": [
             {
                 "role": m.role.value,
@@ -171,7 +170,7 @@ def _session_from_dict(data: dict) -> ChatSession:
         messages=messages,
         created_at=datetime.fromisoformat(data["created_at"]),
         updated_at=datetime.fromisoformat(data["updated_at"]),
-        de_sessions=data.get("de_sessions", {}),
+        de_session_name=data.get("de_session_name"),
     )
 
 

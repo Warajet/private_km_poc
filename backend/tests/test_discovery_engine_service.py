@@ -1,10 +1,11 @@
 """
-Unit tests for DiscoveryEngineService.answer_query() integration.
+Unit tests for DiscoveryEngineService.answer_query() with DataStoreSpecs.
 
 All GCP client calls are mocked; these tests verify:
-  - Correct AnswerQueryRequest construction (filter, session, serving_config)
-  - Reference parsing (ChunkInfo and UnstructuredDocumentInfo shapes)
-  - AggregatedAnswer assembly (best answer selection, dedup, session update)
+  - Correct DataStoreSpec construction (filters, datastore resource names)
+  - Filter logic (CONFIDENTIAL gets explicit filter; others rely on ACL)
+  - Response parsing (ChunkInfo and UnstructuredDocumentInfo shapes)
+  - AnswerResult assembly (answer text, references, session name)
 """
 
 from __future__ import annotations
@@ -15,11 +16,7 @@ import pytest
 
 from app.models.datastore import DatastoreTarget
 from app.models.user import AccessLevel, GCPIdentity
-from app.services.discovery_engine_service import (
-    AggregatedAnswer,
-    DiscoveryEngineService,
-    TargetAnswer,
-)
+from app.services.discovery_engine_service import AnswerResult, DiscoveryEngineService
 
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
@@ -27,6 +24,7 @@ from app.services.discovery_engine_service import (
 @pytest.fixture(autouse=True)
 def mock_settings(monkeypatch):
     monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
+    monkeypatch.setenv("DISCOVERY_ENGINE_ENGINE_ID", "test-engine")
     monkeypatch.setenv("WORKSPACE_DOMAIN", "hello.org")
     monkeypatch.setenv("JWT_SECRET", "test-secret")
     import app.config as cfg
@@ -80,100 +78,137 @@ class TestFilterConstruction:
             "ds-conf", AccessLevel.CONFIDENTIAL, jd_code="", label="confidential"
         )
         f = service._build_filter(target)
-        # Safety net: matches nothing
         assert "__never__" in f
 
 
-# ── Session path construction ──────────────────────────────────────────────────
+# ── DataStoreSpec construction ─────────────────────────────────────────────────
+
+class TestDataStoreSpecConstruction:
+    def test_spec_count_matches_targets(self, service):
+        targets = [
+            DatastoreTarget("ds-pub", AccessLevel.PUBLIC, label="public"),
+            DatastoreTarget("ds-int", AccessLevel.INTERNAL, label="internal"),
+        ]
+        specs = service._build_data_store_specs(targets)
+        assert len(specs) == 2
+
+    def test_spec_has_full_resource_name(self, service):
+        targets = [DatastoreTarget("my-ds", AccessLevel.PUBLIC, label="public")]
+        specs = service._build_data_store_specs(targets)
+        assert "test-project" in specs[0].data_store
+        assert "my-ds" in specs[0].data_store
+
+    def test_public_spec_has_no_filter(self, service):
+        targets = [DatastoreTarget("ds-pub", AccessLevel.PUBLIC, label="public")]
+        specs = service._build_data_store_specs(targets)
+        assert not specs[0].filter
+
+    def test_confidential_spec_has_filter(self, service):
+        from google.cloud import discoveryengine_v1 as de
+        with patch("app.services.discovery_engine_service.discoveryengine", de):
+            targets = [DatastoreTarget("ds-conf", AccessLevel.CONFIDENTIAL, jd_code="ENG001", label="conf")]
+            specs = service._build_data_store_specs(targets)
+            assert "ENG001" in specs[0].filter
+
+
+# ── Session path ───────────────────────────────────────────────────────────────
 
 class TestSessionPath:
-    def test_auto_create_session_when_empty(self, service):
-        path = service._resolve_session("ds-pub", "")
+    def test_engine_session_auto_path_ends_with_dash(self, service):
+        path = service._settings.engine_session_auto_path()
         assert path.endswith("/sessions/-")
-        assert "ds-pub" in path
+        assert "test-engine" in path
         assert "test-project" in path
 
-    def test_continues_existing_session(self, service):
-        existing = "projects/p/locations/global/collections/c/dataStores/ds/sessions/123"
-        path = service._resolve_session("ds-pub", existing)
-        assert path == existing
+    def test_answer_query_uses_existing_session(self, service):
+        """When existing_session is provided it is passed straight to the request."""
+        existing = "projects/p/locations/global/collections/c/engines/e/sessions/123"
+        targets = [DatastoreTarget("ds-pub", AccessLevel.PUBLIC, label="public")]
+
+        captured = {}
+
+        def fake_answer_query(request):
+            captured["session"] = request.session
+            mock_resp = MagicMock()
+            mock_resp.answer = None
+            mock_resp.session = existing
+            return mock_resp
+
+        service._client.answer_query = fake_answer_query
+        service.answer_query("hello", targets, existing_session=existing)
+        assert captured["session"] == existing
+
+    def test_answer_query_auto_creates_session_when_empty(self, service):
+        targets = [DatastoreTarget("ds-pub", AccessLevel.PUBLIC, label="public")]
+
+        captured = {}
+
+        def fake_answer_query(request):
+            captured["session"] = request.session
+            mock_resp = MagicMock()
+            mock_resp.answer = None
+            mock_resp.session = "projects/p/engines/e/sessions/new"
+            return mock_resp
+
+        service._client.answer_query = fake_answer_query
+        service.answer_query("hello", targets, existing_session="")
+        assert captured["session"].endswith("/sessions/-")
 
 
-# ── Serving config path ────────────────────────────────────────────────────────
+# ── AnswerResult assembly ──────────────────────────────────────────────────────
 
-class TestServingConfigPath:
-    def test_path_includes_all_segments(self, service):
-        path = service._serving_config_path("my-datastore")
-        assert "test-project" in path
-        assert "my-datastore" in path
-        assert "servingConfigs" in path
+class TestAnswerResult:
+    def _mock_response(self, answer_text="", session_name="projects/p/sessions/s1"):
+        resp = MagicMock()
+        if answer_text:
+            resp.answer = MagicMock()
+            resp.answer.answer_text = answer_text
+            resp.answer.references = []
+        else:
+            resp.answer = None
+        resp.session = session_name
+        return resp
 
-
-# ── Answer aggregation ─────────────────────────────────────────────────────────
-
-class TestAggregation:
-    def _make_doc(self, doc_id: str, score: float = 0.5):
-        from app.models.document import DocumentStructData, RetrievedDocument
-        return RetrievedDocument(
-            id=doc_id,
-            struct_data=DocumentStructData(title=f"Doc {doc_id}"),
-            relevance_score=score,
-        )
-
-    def test_picks_answer_with_most_references(self, service):
-        ta1 = TargetAnswer("ds-a", "a", "Short answer.", [self._make_doc("d1")], grounded=True)
-        ta2 = TargetAnswer("ds-b", "b", "Longer answer with more refs.",
-                           [self._make_doc("d2"), self._make_doc("d3"), self._make_doc("d4")],
-                           grounded=True)
-        result = service._aggregate([ta1, ta2])
-        assert result.answer_text == "Longer answer with more refs."
-
-    def test_merges_all_references(self, service):
-        ta1 = TargetAnswer("ds-a", "a", "Answer A.", [self._make_doc("d1")], grounded=True)
-        ta2 = TargetAnswer("ds-b", "b", "Answer B.", [self._make_doc("d2")], grounded=True)
-        result = service._aggregate([ta1, ta2])
-        doc_ids = {d.id for d in result.references}
-        assert doc_ids == {"d1", "d2"}
-
-    def test_deduplicates_references(self, service):
-        same_doc = self._make_doc("d1", score=0.9)
-        ta1 = TargetAnswer("ds-a", "a", "Answer.", [same_doc], grounded=True)
-        ta2 = TargetAnswer("ds-b", "b", "Answer.", [same_doc], grounded=True)
-        result = service._aggregate([ta1, ta2])
-        assert len(result.references) == 1
-
-    def test_references_sorted_by_relevance(self, service):
-        ta = TargetAnswer(
-            "ds-a", "a", "Answer.",
-            [self._make_doc("low", 0.1), self._make_doc("high", 0.9), self._make_doc("mid", 0.5)],
-            grounded=True,
-        )
-        result = service._aggregate([ta])
-        scores = [d.relevance_score for d in result.references]
-        assert scores == sorted(scores, reverse=True)
-
-    def test_updates_session_names(self, service):
-        ta1 = TargetAnswer("ds-a", "a", "Ans.", [], session_name="projects/p/sessions/s1")
-        ta2 = TargetAnswer("ds-b", "b", "Ans.", [], session_name="projects/p/sessions/s2")
-        result = service._aggregate([ta1, ta2])
-        assert result.updated_de_sessions == {
-            "ds-a": "projects/p/sessions/s1",
-            "ds-b": "projects/p/sessions/s2",
-        }
-
-    def test_empty_targets_returns_empty_aggregated(self, service):
-        result = service._aggregate([])
+    def test_empty_targets_returns_empty_result(self, service):
+        result = service.answer_query("q", targets=[])
         assert result.answer_text == ""
+        assert result.session_name == ""
         assert result.references == []
         assert result.grounded is False
 
-    def test_no_grounded_answers_uses_ungrounded_text(self, service):
-        ta = TargetAnswer("ds-a", "a", "Partial answer.", [], grounded=False)
-        result = service._aggregate([ta])
-        assert result.answer_text == "Partial answer."
+    def test_answer_text_extracted(self, service):
+        resp = self._mock_response(answer_text="The answer.")
+        service._client.answer_query = MagicMock(return_value=resp)
+        targets = [DatastoreTarget("ds-pub", AccessLevel.PUBLIC, label="public")]
+        result = service.answer_query("q", targets)
+        assert result.answer_text == "The answer."
+
+    def test_session_name_extracted(self, service):
+        resp = self._mock_response(answer_text="A.", session_name="projects/p/sessions/s99")
+        service._client.answer_query = MagicMock(return_value=resp)
+        targets = [DatastoreTarget("ds-pub", AccessLevel.PUBLIC, label="public")]
+        result = service.answer_query("q", targets)
+        assert result.session_name == "projects/p/sessions/s99"
+
+    def test_grounded_false_when_no_references(self, service):
+        resp = self._mock_response(answer_text="A.")
+        service._client.answer_query = MagicMock(return_value=resp)
+        targets = [DatastoreTarget("ds-pub", AccessLevel.PUBLIC, label="public")]
+        result = service.answer_query("q", targets)
         assert result.grounded is False
 
-    def test_grounded_flag_set_when_references_exist(self, service):
-        ta = TargetAnswer("ds-a", "a", "Answer.", [self._make_doc("d1")], grounded=True)
-        result = service._aggregate([ta])
-        assert result.grounded is True
+    def test_engine_serving_config_used_in_request(self, service):
+        captured = {}
+
+        def fake_answer_query(request):
+            captured["serving_config"] = request.serving_config
+            mock_resp = MagicMock()
+            mock_resp.answer = None
+            mock_resp.session = ""
+            return mock_resp
+
+        service._client.answer_query = fake_answer_query
+        targets = [DatastoreTarget("ds-pub", AccessLevel.PUBLIC, label="public")]
+        service.answer_query("q", targets)
+        assert "test-engine" in captured["serving_config"]
+        assert "servingConfigs" in captured["serving_config"]

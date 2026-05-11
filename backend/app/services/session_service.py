@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from app.config import Settings, get_settings
 from app.models.chat import ChatMessage, ChatSession, MessageRole
@@ -91,16 +91,15 @@ class SessionService:
 
     # ── Discovery Engine session tracking ──────────────────────────────────────
 
-    def update_de_sessions(
+    def update_de_session(
         self,
         session: ChatSession,
-        updated_sessions: Dict[str, str],
+        session_name: str,
     ) -> None:
         """
-        Merge new/updated Discovery Engine session resource names into the
-        ChatSession.  updated_sessions maps datastore_id → de_session_name.
-        Called after each answer_query turn to persist the returned session names
-        so that subsequent turns can continue the DE conversations.
+        Persist the Discovery Engine engine-level session resource name.
+        Called after each answer_query turn so subsequent turns can continue
+        the multi-turn conversation.
         """
-        session.de_sessions.update(updated_sessions)
+        session.de_session_name = session_name
         self._repo.save(session)

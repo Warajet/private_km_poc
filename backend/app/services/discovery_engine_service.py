@@ -1,46 +1,55 @@
 """
-DiscoveryEngineService — uses ConversationalSearchServiceClient.answer_query()
+DiscoveryEngineService — ConversationalSearchServiceClient.answer_query()
+                         with DataStoreSpecs for multi-bucket access control.
 
-This is the correct Gemini Enterprise pattern from the Discovery Engine API.
-One answer_query call per accessible datastore target combines:
-  - Document retrieval (with ACL enforcement via impersonated credentials)
-  - Answer generation   (Gemini grounded on the retrieved documents)
+How DataStoreSpecs work
+────────────────────────
+Instead of making N separate answer_query() calls (one per accessible bucket),
+a single request carries a list of DataStoreSpec entries — one per bucket that
+the routing layer has authorised for this user.
 
-There is NO separate GeminiService. answer_query() handles both steps in a
-single API call.
+  AnswerQueryRequest(
+      serving_config = engine_serving_config,   ← engine-level (required)
+      query          = Query(text=user_message),
+      session        = session_name,            ← one per chat session
+      search_spec    = SearchSpec(
+          search_params = SearchParams(
+              data_store_specs = [
+                  SearchRequest.DataStoreSpec(data_store="…/dataStores/public-ds"),
+                  SearchRequest.DataStoreSpec(data_store="…/dataStores/internal-a-ds"),
+                  SearchRequest.DataStoreSpec(data_store="…/dataStores/relate-ab-ds"),
+                  SearchRequest.DataStoreSpec(
+                      data_store="…/dataStores/confidential-ds",
+                      filter='structData.department: ANY("A") AND '
+                             'structData.required_jd_code: ANY("ENG001")',
+                  ),
+              ],
+          ),
+      ),
+  )
 
-Multi-turn session management
-──────────────────────────────
-Discovery Engine sessions are per-datastore. For a chat session that spans
-N accessible datastores, we maintain N DE sessions (one per datastore_id).
+Discovery Engine:
+  • Searches all listed datastores with a single Gemini grounding pass.
+  • Enforces acl_info on every document via the impersonated credentials.
+  • Applies the per-DataStoreSpec filter before the confidential datastore is
+    searched (JD-code gate at the document level on top of ACL).
+  • Returns one coherent Answer with citations referencing both datastores.
+  • Returns one session resource name — pass it on the next turn to continue
+    the multi-turn conversation.
 
-Turn 1 – no existing DE session for a target:
-  Pass session = auto_session_path(datastore_id)  →  DE creates a new session
-  Response carries the real session resource name  →  store in de_sessions dict
-
-Turn 2+ – existing DE session:
-  Pass session = de_sessions[datastore_id]         →  DE continues conversation
-  Response updates the session resource name       →  update de_sessions dict
-
-If a new bucket becomes accessible (e.g. user joins a relate group), a new
-session is auto-created for that bucket on first use.
-
-ACL enforcement
-───────────────
-Every answer_query request is made with the caller's impersonated credentials
-(domain-wide delegation). Discovery Engine evaluates acl_info on each document
-against the calling identity automatically.
-
-For CONFIDENTIAL targets an additional filter expression is embedded in the
-SearchSpec to restrict results to documents matching the user's JD code.
+Architecture note
+──────────────────
+  Layer 1 (DatastoreRoutingService) → determines WHICH DataStoreSpec entries
+    to include, i.e. WHICH buckets this user may query.
+  Layer 2 (this service)            → answer_query() enforces ACL inside each
+    listed bucket via impersonated credentials + optional per-spec filter.
 """
 
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 from google.cloud import discoveryengine_v1 as discoveryengine
 
@@ -54,34 +63,21 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class TargetAnswer:
-    """Answer produced by a single answer_query call for one datastore target."""
-    datastore_id: str
-    label: str
+class AnswerResult:
+    """
+    The result of a single answer_query() call spanning all accessible buckets.
+    """
     answer_text: str
     references: List[RetrievedDocument] = field(default_factory=list)
-    # Updated session resource name returned by DE (pass on next turn)
+    # Updated DE session resource name — store on ChatSession for next turn
     session_name: str = ""
-    grounded: bool = False
-
-
-@dataclass
-class AggregatedAnswer:
-    """Merged result from all accessible datastore targets."""
-    answer_text: str
-    references: List[RetrievedDocument]
-    # Updated de_sessions to persist on the ChatSession after this turn
-    updated_de_sessions: Dict[str, str]
     grounded: bool = False
 
 
 class DiscoveryEngineService:
     """
-    Wraps ConversationalSearchServiceClient.answer_query() for multi-datastore
-    access-controlled grounded search.
-
-    One instance is created per-request by the controller, scoped to the
-    caller's impersonated GCP credentials.
+    One instance per request.  Builds and executes a single answer_query()
+    call whose DataStoreSpecs list is determined by the routing layer.
     """
 
     def __init__(
@@ -102,133 +98,130 @@ class DiscoveryEngineService:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def answer_all_targets(
+    def answer_query(
         self,
         query: str,
         targets: List[DatastoreTarget],
-        de_sessions: Dict[str, str],
-    ) -> AggregatedAnswer:
+        existing_session: str = "",
+    ) -> AnswerResult:
         """
-        Call answer_query() for every accessible datastore target in parallel.
+        Execute a single answer_query() for all accessible datastore buckets.
 
-        de_sessions  – existing DE session resource names keyed by datastore_id.
-                       Empty dict on first turn; populated from prior response.
-
-        Returns an AggregatedAnswer with:
-          - answer_text:        best single answer (most grounded) or
-                                combined when multiple datastores contribute
-          - references:         deduplicated union of all target references
-          - updated_de_sessions: new session names to store on the ChatSession
+        targets          – List[DatastoreTarget] from DatastoreRoutingService.
+                           Each entry becomes one DataStoreSpec in the request.
+        existing_session – DE session resource name from the previous turn.
+                           Empty string on the first turn (auto-create).
         """
         if not targets:
-            return AggregatedAnswer(
-                answer_text="",
-                references=[],
-                updated_de_sessions={},
-            )
+            return AnswerResult(answer_text="", session_name="")
 
-        target_answers: List[TargetAnswer] = []
+        data_store_specs = self._build_data_store_specs(targets)
+        session = existing_session or self._settings.engine_session_auto_path()
 
-        with ThreadPoolExecutor(max_workers=len(targets)) as pool:
-            futures = {
-                pool.submit(
-                    self._answer_single_target,
-                    query,
-                    target,
-                    de_sessions.get(target.datastore_id, ""),
-                ): target
-                for target in targets
-            }
-            for future in as_completed(futures):
-                target = futures[future]
-                try:
-                    ta = future.result()
-                    target_answers.append(ta)
-                    logger.debug(
-                        "Bucket %s → %d refs, session=%s",
-                        ta.label,
-                        len(ta.references),
-                        ta.session_name,
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "answer_query failed for bucket %s: %s",
-                        target.label,
-                        exc,
-                        exc_info=True,
-                    )
-
-        return self._aggregate(target_answers)
-
-    # ── Per-target answer_query call ───────────────────────────────────────────
-
-    def _answer_single_target(
-        self,
-        query: str,
-        target: DatastoreTarget,
-        existing_session: str,
-    ) -> TargetAnswer:
-        """
-        Execute one answer_query() call for a single DatastoreTarget.
-
-        existing_session  – "" for first turn (DE auto-creates a new session)
-                            resource-name string to continue an existing session
-        """
-        serving_config = self._serving_config_path(target.datastore_id)
-        session = self._resolve_session(target.datastore_id, existing_session)
-
-        request = discoveryengine.AnswerQueryRequest(
-            serving_config=serving_config,
-            # Core query
+        AQR = discoveryengine.AnswerQueryRequest
+        request = AQR(
+            serving_config=self._settings.engine_serving_config_path,
+            # User's query for this turn
             query=discoveryengine.Query(text=query),
-            # Session: auto-create on first turn, continue on subsequent turns
+            # Continues the multi-turn conversation in DE (auto-creates on first turn)
             session=session,
-            # Stable pseudo-id for session tracking / analytics
+            # Stable pseudo-id for DE analytics / session tracking
             user_pseudo_id=self._gcp_identity.impersonated_email,
-            # Query understanding: rephrase + classify
+            # ── Multi-bucket access control via SearchSpec.SearchParams ────────
+            # DataStoreSpec entries live inside search_spec.search_params.
+            # Each entry names one accessible bucket with an optional filter.
+            # ACL (acl_info) is enforced automatically by DE against the
+            # impersonated credentials; the filter adds the extra JD-code gate
+            # for the CONFIDENTIAL bucket.
+            search_spec=AQR.SearchSpec(
+                search_params=AQR.SearchSpec.SearchParams(
+                    data_store_specs=data_store_specs,
+                ),
+            ),
+            # ── Query understanding ────────────────────────────────────────────
             query_understanding_spec=self._build_query_understanding_spec(),
-            # Answer generation: model + system prompt + citations
+            # ── Answer generation (Gemini) ─────────────────────────────────────
             answer_generation_spec=self._build_answer_generation_spec(),
-            # Search: document count + JD-code filter for CONFIDENTIAL
-            search_spec=self._build_search_spec(target),
-            # Related questions (optional UX enhancement)
-            related_questions_spec=discoveryengine.AnswerQueryRequest.RelatedQuestionsSpec(
+            # ── Related questions (optional UX) ───────────────────────────────
+            related_questions_spec=AQR.RelatedQuestionsSpec(
                 enable=False,
             ),
         )
 
-        response = self._client.answer_query(request=request)
-
-        answer_text = ""
-        if response.answer and response.answer.answer_text:
-            answer_text = response.answer.answer_text
-
-        references = self._extract_references(response)
-        new_session = response.session or session
-
-        return TargetAnswer(
-            datastore_id=target.datastore_id,
-            label=target.label,
-            answer_text=answer_text,
-            references=references,
-            session_name=new_session,
-            grounded=bool(references),
+        logger.info(
+            "answer_query: user=%s buckets=%s session=%s",
+            self._gcp_identity.impersonated_email,
+            [t.label for t in targets],
+            session,
         )
 
-    # ── Request builders ───────────────────────────────────────────────────────
+        response = self._client.answer_query(request=request)
+        return self._parse_response(response, session)
+
+    # ── DataStoreSpecs construction ────────────────────────────────────────────
+
+    def _build_data_store_specs(
+        self,
+        targets: List[DatastoreTarget],
+    ) -> List[discoveryengine.SearchRequest.DataStoreSpec]:
+        """
+        Convert routing targets to SearchRequest.DataStoreSpec objects.
+
+        These are placed inside AnswerQueryRequest.SearchSpec.SearchParams.
+        PUBLIC / INTERNAL / RELATE  → spec with no filter (ACL handles it)
+        CONFIDENTIAL                → spec with dept + JD-code filter expression
+        """
+        specs = []
+        for target in targets:
+            filter_expr = self._build_filter(target)
+            spec = discoveryengine.SearchRequest.DataStoreSpec(
+                data_store=self._settings.datastore_resource_name(target.datastore_id),
+                filter=filter_expr,
+            )
+            specs.append(spec)
+            logger.debug(
+                "DataStoreSpec: bucket=%s ds=%s filter=%r",
+                target.label,
+                target.datastore_id,
+                filter_expr or "(none)",
+            )
+        return specs
+
+    def _build_filter(self, target: DatastoreTarget) -> str:
+        """
+        Only CONFIDENTIAL targets need an explicit filter.
+        All other buckets rely entirely on Discovery Engine ACL (acl_info)
+        evaluated against the impersonated credentials.
+        """
+        if target.access_level != AccessLevel.CONFIDENTIAL:
+            return ""
+
+        dept = self._gcp_identity.department.upper()
+        jd = (target.jd_code or "").upper()
+        if not jd:
+            # No JD code → safety net: match nothing in the confidential bucket
+            return 'structData.required_jd_code: ANY("__never__")'
+
+        return (
+            f'structData.department: ANY("{dept}") AND '
+            f'structData.required_jd_code: ANY("{jd}")'
+        )
+
+    # ── Request spec builders ──────────────────────────────────────────────────
 
     def _build_query_understanding_spec(
         self,
     ) -> discoveryengine.AnswerQueryRequest.QueryUnderstandingSpec:
-        return discoveryengine.AnswerQueryRequest.QueryUnderstandingSpec(
-            query_rephraser_spec=discoveryengine.AnswerQueryRequest.QueryUnderstandingSpec.QueryRephraserSpec(
+        QUS = discoveryengine.AnswerQueryRequest.QueryUnderstandingSpec
+        return QUS(
+            query_rephraser_spec=QUS.QueryRephraserSpec(
                 disable=False,
                 max_rephrase_steps=1,
             ),
-            query_classification_spec=discoveryengine.AnswerQueryRequest.QueryUnderstandingSpec.QueryClassificationSpec(
+            query_classification_spec=QUS.QueryClassificationSpec(
                 types=[
-                    discoveryengine.AnswerQueryRequest.QueryUnderstandingSpec.QueryClassificationSpec.Type.ADVERSARIAL_QUERY,
-                    discoveryengine.AnswerQueryRequest.QueryUnderstandingSpec.QueryClassificationSpec.Type.NON_ANSWER_SEEKING_QUERY,
+                    QUS.QueryClassificationSpec.Type.ADVERSARIAL_QUERY,
+                    QUS.QueryClassificationSpec.Type.NON_ANSWER_SEEKING_QUERY,
                 ]
             ),
         )
@@ -236,11 +229,12 @@ class DiscoveryEngineService:
     def _build_answer_generation_spec(
         self,
     ) -> discoveryengine.AnswerQueryRequest.AnswerGenerationSpec:
-        return discoveryengine.AnswerQueryRequest.AnswerGenerationSpec(
-            model_spec=discoveryengine.AnswerQueryRequest.AnswerGenerationSpec.ModelSpec(
+        AGS = discoveryengine.AnswerQueryRequest.AnswerGenerationSpec
+        return AGS(
+            model_spec=AGS.ModelSpec(
                 model_version=self._settings.gemini_model,
             ),
-            prompt_spec=discoveryengine.AnswerQueryRequest.AnswerGenerationSpec.PromptSpec(
+            prompt_spec=AGS.PromptSpec(
                 preamble=self._settings.gemini_system_prompt,
             ),
             include_citations=True,
@@ -249,86 +243,47 @@ class DiscoveryEngineService:
             ignore_non_answer_seeking_query=True,
         )
 
-    def _build_search_spec(
+    # ── Response parsing ───────────────────────────────────────────────────────
+
+    def _parse_response(
         self,
-        target: DatastoreTarget,
-    ) -> discoveryengine.AnswerQueryRequest.SearchSpec:
-        filter_expr = self._build_filter(target)
-        params = discoveryengine.AnswerQueryRequest.SearchSpec.SearchParams(
-            max_return_results=10,
+        response: discoveryengine.AnswerQueryResponse,
+        fallback_session: str,
+    ) -> AnswerResult:
+        answer_text = ""
+        if response.answer and response.answer.answer_text:
+            answer_text = response.answer.answer_text
+
+        references = self._extract_references(response)
+        # DE returns the (possibly newly created) session resource name
+        session_name = response.session or fallback_session
+
+        return AnswerResult(
+            answer_text=answer_text,
+            references=references,
+            session_name=session_name,
+            grounded=bool(references),
         )
-        if filter_expr:
-            params.filter = filter_expr
-        return discoveryengine.AnswerQueryRequest.SearchSpec(search_params=params)
-
-    def _build_filter(self, target: DatastoreTarget) -> str:
-        """
-        Confidential targets require a dept + JD-code filter so that a user
-        cannot read another department's confidential docs even if they are in
-        the same confidential datastore.
-
-        All other bucket types rely entirely on Discovery Engine ACL (acl_info).
-        """
-        if target.access_level != AccessLevel.CONFIDENTIAL:
-            return ""
-
-        dept = self._gcp_identity.department.upper()
-        jd = (target.jd_code or "").upper()
-        if not jd:
-            # Safety net: no JD code → match nothing in confidential bucket
-            return 'structData.required_jd_code: ANY("__never__")'
-
-        return (
-            f'structData.department: ANY("{dept}") AND '
-            f'structData.required_jd_code: ANY("{jd}")'
-        )
-
-    # ── Session helpers ────────────────────────────────────────────────────────
-
-    def _resolve_session(self, datastore_id: str, existing_session: str) -> str:
-        """
-        Return the session value to pass to answer_query.
-
-        If no existing session → auto-create path (.../sessions/-)
-        If existing session resource name → pass it directly to continue the turn
-        """
-        if existing_session:
-            return existing_session
-        # Auto-create: Discovery Engine will create a new session and return its name
-        return (
-            f"projects/{self._settings.gcp_project_id}"
-            f"/locations/{self._settings.gcp_location}"
-            f"/collections/default_collection"
-            f"/dataStores/{datastore_id}"
-            f"/sessions/-"
-        )
-
-    # ── Reference extraction ───────────────────────────────────────────────────
 
     def _extract_references(
         self,
         response: discoveryengine.AnswerQueryResponse,
     ) -> List[RetrievedDocument]:
-        """
-        Parse Answer.references into RetrievedDocument objects.
-
-        The DE API returns references in one of two shapes:
-          - chunk_info         (chunked datastores)
-          - unstructured_document_info  (unstructured/HTML datastores)
-        """
         if not response.answer or not response.answer.references:
             return []
 
         docs: List[RetrievedDocument] = []
-        seen_docs: set[str] = set()  # deduplicate by document resource name
+        seen: set[str] = set()
 
         for ref in response.answer.references:
             doc = self._parse_reference(ref)
-            if doc and doc.id not in seen_docs:
-                seen_docs.add(doc.id)
+            if doc and doc.id not in seen:
+                seen.add(doc.id)
                 docs.append(doc)
 
-        return docs
+        # Sort by relevance score descending
+        docs.sort(key=lambda d: d.relevance_score, reverse=True)
+        return docs[:20]
 
     def _parse_reference(
         self,
@@ -340,7 +295,7 @@ class DiscoveryEngineService:
                 ci = ref.chunk_info
                 meta = ci.document_metadata
                 doc_id = meta.document or meta.uri or "unknown"
-                struct_data = self._parse_struct_data_from_proto(
+                struct_data = self._struct_data_from_proto(
                     getattr(meta, "struct_data", None)
                 )
                 struct_data.title = struct_data.title or meta.title or ""
@@ -357,8 +312,7 @@ class DiscoveryEngineService:
             if ref.unstructured_document_info:
                 udi = ref.unstructured_document_info
                 doc_id = udi.document or udi.uri or "unknown"
-                snippet = ""
-                score = 0.0
+                snippet, score = "", 0.0
                 if udi.chunk_contents:
                     best = max(
                         udi.chunk_contents,
@@ -367,8 +321,7 @@ class DiscoveryEngineService:
                     )
                     snippet = best.content
                     score = best.relevance_score or 0.0
-
-                struct_data = self._parse_struct_data_from_proto(
+                struct_data = self._struct_data_from_proto(
                     getattr(udi, "struct_data", None)
                 )
                 struct_data.title = struct_data.title or udi.title or ""
@@ -382,11 +335,10 @@ class DiscoveryEngineService:
                 )
         except Exception as exc:
             logger.warning("Failed to parse reference: %s", exc)
-
         return None
 
     @staticmethod
-    def _parse_struct_data_from_proto(struct_proto) -> DocumentStructData:
+    def _struct_data_from_proto(struct_proto) -> DocumentStructData:
         sd: dict = {}
         if struct_proto:
             for key, val in struct_proto.fields.items():
@@ -413,80 +365,7 @@ class DiscoveryEngineService:
             source_uri=sd.get("source_uri"),
         )
 
-    # ── Answer aggregation ─────────────────────────────────────────────────────
-
-    def _aggregate(self, target_answers: List[TargetAnswer]) -> AggregatedAnswer:
-        """
-        Merge answers from all targets into a single AggregatedAnswer.
-
-        Strategy
-        ─────────
-        1. Collect updated session names for every target (first turn or
-           continued turn).
-        2. Identify targets that returned a grounded answer (non-empty text
-           AND at least one reference).
-        3. Pick the primary answer:
-           - From the grounded target with the most references.
-           - If no grounded answer exists, use the first non-empty text.
-           - Fall back to empty string.
-        4. Merge all reference lists, deduplicating by document id, sorted by
-           relevance score descending.
-        """
-        updated_sessions: Dict[str, str] = {}
-        all_refs: List[RetrievedDocument] = []
-        seen_doc_ids: set[str] = set()
-
-        grounded_answers = [ta for ta in target_answers if ta.grounded and ta.answer_text]
-        ungrounded_answers = [ta for ta in target_answers if ta.answer_text and not ta.grounded]
-
-        for ta in target_answers:
-            if ta.session_name:
-                updated_sessions[ta.datastore_id] = ta.session_name
-            for doc in ta.references:
-                if doc.id not in seen_doc_ids:
-                    seen_doc_ids.add(doc.id)
-                    all_refs.append(doc)
-
-        # Sort merged references by relevance descending
-        all_refs.sort(key=lambda d: d.relevance_score, reverse=True)
-
-        # Select primary answer text
-        if grounded_answers:
-            # Use the answer backed by the most documents
-            primary = max(grounded_answers, key=lambda ta: len(ta.references))
-            answer_text = primary.answer_text
-        elif ungrounded_answers:
-            answer_text = ungrounded_answers[0].answer_text
-        else:
-            answer_text = ""
-
-        logger.info(
-            "Aggregated: %d targets → %d grounded, %d unique refs, answer_len=%d",
-            len(target_answers),
-            len(grounded_answers),
-            len(all_refs),
-            len(answer_text),
-        )
-
-        return AggregatedAnswer(
-            answer_text=answer_text,
-            references=all_refs[:20],  # cap at 20 to keep response size sane
-            updated_de_sessions=updated_sessions,
-            grounded=bool(grounded_answers),
-        )
-
-    # ── Path helpers ───────────────────────────────────────────────────────────
-
-    def _serving_config_path(self, datastore_id: str) -> str:
-        return (
-            f"projects/{self._settings.gcp_project_id}"
-            f"/locations/{self._settings.gcp_location}"
-            f"/collections/default_collection"
-            f"/dataStores/{datastore_id}"
-            f"/servingConfigs/{self._settings.discovery_engine_serving_config_id}"
-        )
-
-    # ── Expose credentials for reuse ───────────────────────────────────────────
+    # ── Credential exposure ────────────────────────────────────────────────────
 
     @property
     def credentials(self):

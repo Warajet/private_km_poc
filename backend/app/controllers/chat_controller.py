@@ -5,33 +5,34 @@ answer_query() flow per turn
 ──────────────────────────────
  ┌─────────────────────────────────────────────────────────────────────────┐
  │  LAYER 1 — API Routing  (DatastoreRoutingService)                       │
- │  Selects which datastore buckets to query.                              │
+ │  Selects which datastore buckets to include as DataStoreSpecs.          │
  └───────────────────────────────────┬─────────────────────────────────────┘
                                      │  List[DatastoreTarget]
  ┌───────────────────────────────────▼─────────────────────────────────────┐
  │  LAYER 2 — answer_query()  (DiscoveryEngineService)                     │
  │                                                                         │
- │  For each target:                                                       │
+ │  Single call:                                                           │
  │    ConversationalSearchServiceClient.answer_query(                      │
- │        serving_config = <bucket-datastore-serving-config>,              │
- │        query          = Query(text=user_message),                       │
- │        session        = de_sessions[datastore_id],  # multi-turn       │
- │        user_pseudo_id = impersonated_email,                             │
+ │        serving_config  = engine_serving_config,                        │
+ │        query           = Query(text=user_message),                     │
+ │        session         = de_session_name,  # one session per chat      │
+ │        data_store_specs= [DataStoreSpec(ds, filter?), ...],            │
+ │        user_pseudo_id  = impersonated_email,                           │
  │        ...                                                              │
  │    )                                                                    │
  │                                                                         │
- │  → Discovery Engine enforces acl_info against impersonated credentials │
- │  → Gemini generates a grounded answer from retrieved documents         │
- │  → Response.session contains the updated session name                  │
+ │  → DE enforces acl_info against impersonated credentials per bucket    │
+ │  → Gemini generates a single grounded answer across all buckets        │
+ │  → Response.session contains the (possibly new) session resource name  │
  └───────────────────────────────────┬─────────────────────────────────────┘
-                                     │  AggregatedAnswer
+                                     │  AnswerResult
  ┌───────────────────────────────────▼─────────────────────────────────────┐
  │  Session update                                                         │
- │  Store updated DE session names so next turn continues each conversation│
+ │  Store returned DE session name so next turn continues the conversation │
  └─────────────────────────────────────────────────────────────────────────┘
 
 No separate GeminiService exists. answer_query() handles both retrieval and
-answer generation in a single API call.
+answer generation in a single API call across all accessible datastores.
 """
 
 from __future__ import annotations
@@ -109,12 +110,12 @@ class ChatController:
         )
 
         try:
-            aggregated = de_service.answer_all_targets(
+            result = de_service.answer_query(
                 query=request.message,
                 targets=targets,
-                # Pass existing DE session names so answer_query() continues
-                # the multi-turn conversation within each datastore bucket.
-                de_sessions=session.de_sessions,
+                # Pass the existing engine-level session name so answer_query()
+                # continues the multi-turn conversation (auto-creates on first turn).
+                existing_session=session.de_session_name or "",
             )
         except Exception as exc:
             logger.error("answer_query error: %s", exc, exc_info=True)
@@ -123,21 +124,19 @@ class ChatController:
                 detail="Error retrieving answer from the knowledge base.",
             ) from exc
 
-        # ── 5. Persist updated DE session names for next turn ──────────────────
-        if aggregated.updated_de_sessions:
-            self._session_service.update_de_sessions(
-                session, aggregated.updated_de_sessions
-            )
+        # ── 5. Persist updated DE session name for next turn ───────────────────
+        if result.session_name:
+            self._session_service.update_de_session(session, result.session_name)
 
         # ── 6. Fallback answer when knowledge base has nothing ─────────────────
-        answer_text = aggregated.answer_text or (
+        answer_text = result.answer_text or (
             "I could not find relevant information in the knowledge base for your query. "
             "Please try rephrasing or contact your administrator."
         )
 
         # ── 7. Persist assistant message with source citations ─────────────────
         assistant_msg = self._session_service.append_assistant_message(
-            session, answer_text, aggregated.references
+            session, answer_text, result.references
         )
 
         sources = [
@@ -150,7 +149,7 @@ class ChatController:
                 uri=doc.uri,
                 relevance_score=doc.relevance_score,
             )
-            for doc in aggregated.references
+            for doc in result.references
         ]
 
         return ChatResponse(
@@ -161,7 +160,7 @@ class ChatController:
                 timestamp=assistant_msg.timestamp,
                 sources=sources,
             ),
-            grounded=aggregated.grounded,
+            grounded=result.grounded,
         )
 
     # ── Session management ─────────────────────────────────────────────────────
